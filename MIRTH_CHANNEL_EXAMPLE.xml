@@ -1,0 +1,317 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<channel formatVersion="4.4.0">
+  <id>file-receiver-channel</id>
+  <name>File Receiver from Google Drive Service</name>
+  <description>Receives files (as base64) from Node.js Google Drive → Mirth service. Decodes, stores in database, and sends ACK back to service.</description>
+  <enabled>true</enabled>
+  <version>1</version>
+  
+  <!-- ====================================================================
+       SOURCE: HTTP Listener
+       Receives POST requests with JSON payload from Node.js service
+       ==================================================================== -->
+  <sourceConnector>
+    <metaDataId>0</metaDataId>
+    <name>HTTP Listener</name>
+    <properties class="com.mirth.connect.connectors.http.HttpReceiverProperties">
+      <plugin>HTTP</plugin>
+      <transportName>HTTP</transportName>
+      <mode>SOURCE</mode>
+      
+      <!-- Listener Configuration -->
+      <listenerConnectorProperties>
+        <host>0.0.0.0</host>
+        <port>8080</port>
+      </listenerConnectorProperties>
+      
+      <!-- Receive Properties -->
+      <httpReceiverProperties>
+        <charset>UTF-8</charset>
+        <dataType>JSON</dataType>
+        <parseMultipart>false</parseMultipart>
+        
+        <!-- Path to match requests to this channel -->
+        <dispatcherProperties>
+          <dispatcherPattern>/api/channels/receive</dispatcherPattern>
+        </dispatcherProperties>
+        
+        <!-- Response settings -->
+        <responseContentType>application/json</responseContentType>
+        <responseStatusCode>200</responseStatusCode>
+        <responseHeaders>
+          <entry>
+            <string>Content-Type</string>
+            <string>application/json</string>
+          </entry>
+        </responseHeaders>
+      </httpReceiverProperties>
+    </properties>
+    
+    <!-- Transformer: Parse incoming JSON -->
+    <transformer>
+      <steps>
+        <step index="0">
+          <name>Parse JSON Payload</name>
+          <script>
+            // Input is JSON from Node.js service
+            // Expected format:
+            // {
+            //   "fileName": "19507-discharge.PNG",
+            //   "mimeType": "image/png",
+            //   "patientId": "19507",
+            //   "base64": "iVBORw0KGgo...",
+            //   "timestamp": "2024-01-15T10:30:50.123Z"
+            // }
+            
+            var payload = JSON.parse(msg);
+            
+            // Create message with metadata
+            var message = {
+              fileName: payload.fileName,
+              mimeType: payload.mimeType,
+              patientId: payload.patientId,
+              base64Data: payload.base64,
+              receivedAt: new Date().getTime(),
+              originalTimestamp: payload.timestamp
+            };
+            
+            return JSON.stringify(message);
+          </script>
+        </step>
+      </steps>
+    </transformer>
+  </sourceConnector>
+  
+  <!-- ====================================================================
+       DESTINATION: Database (Store file metadata and mark as processed)
+       ==================================================================== -->
+  <destinationConnectors>
+    <connector>
+      <metaDataId>1</metaDataId>
+      <name>Database - Store File</name>
+      <properties class="com.mirth.connect.connectors.jdbc.DatabaseDispatcherProperties">
+        <plugin>Database</plugin>
+        <transportName>Database</transportName>
+        <mode>DESTINATION</mode>
+        
+        <!-- Database Connection -->
+        <dataSourceName>
+          <class>com.mirth.connect.plugins.datatypes.hl7v2.HL7V2DataTypeProperties</class>
+          <name>production_db</name>  <!-- Configure this in Mirth settings -->
+        </dataSourceName>
+        
+        <useScript>true</useScript>
+        <script>
+          // Log the received file
+          logger.info('=== File Received ===');
+          logger.info('File Name: ' + msg.fileName);
+          logger.info('Patient ID: ' + msg.patientId);
+          logger.info('MIME Type: ' + msg.mimeType);
+          logger.info('Base64 Size: ' + msg.base64Data.length);
+          
+          // Decode base64 and save to file system (optional)
+          var fileName = msg.fileName;
+          var base64Data = msg.base64Data;
+          var patientId = msg.patientId;
+          
+          // Example: Save file to /archive/[patientId]/[fileName]
+          // Requires file system access and appropriate permissions
+          // var bytes = Java.type('java.util.Base64').getDecoder().decode(base64Data);
+          // var path = '/archive/' + patientId + '/' + fileName;
+          // var file = new java.io.File(path);
+          // // ... write bytes to file
+          
+          return true;
+        </script>
+        
+        <!-- INSERT query to store file metadata -->
+        <update>
+          INSERT INTO files_received (
+            patient_id, 
+            file_name, 
+            mime_type, 
+            file_size, 
+            received_at, 
+            source_system,
+            status
+          ) VALUES (
+            '${patientId}',
+            '${fileName}',
+            '${mimeType}',
+            ${base64Data.length()},
+            NOW(),
+            'GoogleDrive-Service',
+            'Processed'
+          )
+        </update>
+      </properties>
+      
+      <!-- Transformer: Prepare data for database -->
+      <transformer>
+        <steps>
+          <step index="0">
+            <name>Extract and Clean Data</name>
+            <script>
+              var payload = JSON.parse(msg);
+              
+              // Sanitize patient ID (numbers only)
+              var patientId = payload.patientId.replace(/[^0-9]/g, '');
+              
+              // Sanitize file name (remove special chars)
+              var fileName = payload.fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+              
+              var result = {
+                patientId: patientId,
+                fileName: fileName,
+                mimeType: payload.mimeType,
+                base64Data: payload.base64,
+                receivedAt: payload.originalTimestamp,
+                dataLength: payload.base64.length
+              };
+              
+              return JSON.stringify(result);
+            </script>
+          </step>
+        </steps>
+      </transformer>
+    </connector>
+    
+    <!-- DESTINATION 2: Send ACK back to Node.js service -->
+    <connector>
+      <metaDataId>2</metaDataId>
+      <name>HTTP - Send ACK to Service</name>
+      <properties class="com.mirth.connect.connectors.http.HttpDispatcherProperties">
+        <plugin>HTTP</plugin>
+        <transportName>HTTP</transportName>
+        <mode>DESTINATION</mode>
+        
+        <!-- ACK Response Configuration -->
+        <httpDispatcherProperties>
+          <charset>UTF-8</charset>
+          <method>POST</method>
+          <contentType>application/json</contentType>
+          <responseContentType>application/json</responseContentType>
+          
+          <!-- URL to send ACK (optional, if you have an ACK endpoint) -->
+          <url>http://localhost:3000/api/ack</url>
+        </httpDispatcherProperties>
+      </properties>
+      
+      <!-- Transformer: Build ACK response -->
+      <transformer>
+        <steps>
+          <step index="0">
+            <name>Build ACK JSON</name>
+            <script>
+              var payload = JSON.parse(msg);
+              
+              // Create ACK response
+              var ack = {
+                status: 'OK',
+                message: 'File received and processed',
+                fileName: payload.fileName,
+                patientId: payload.patientId,
+                processedAt: new Date().toISOString(),
+                recordId: java.util.UUID.randomUUID().toString()
+              };
+              
+              logger.info('Sending ACK for ' + payload.fileName);
+              
+              return JSON.stringify(ack);
+            </script>
+          </step>
+        </steps>
+      </transformer>
+    </connector>
+  </destinationConnectors>
+  
+  <!-- ====================================================================
+       POST-PROCESSOR: Build HTTP Response for Node.js service
+       This sends the HTTP 200 ACK back to the original request
+       ==================================================================== -->
+  <postProcessor>
+    <steps>
+      <step index="0">
+        <name>Create Response</name>
+        <script>
+          // This response goes back to the Node.js service
+          // The service is waiting for HTTP 200 with ACK in body
+          
+          var payload = JSON.parse(msg);
+          
+          var response = {
+            status: 200,
+            message: 'File processed successfully',
+            fileName: payload.fileName,
+            patientId: payload.patientId,
+            timestamp: new Date().toISOString()
+          };
+          
+          // Set HTTP response code
+          responseStatus = 200;
+          
+          // Set response headers (optional)
+          responseHeaders = {
+            'Content-Type': 'application/json',
+            'X-Mirth-Status': 'OK'
+          };
+          
+          // Response body
+          return JSON.stringify(response);
+        </script>
+      </step>
+    </steps>
+  </postProcessor>
+  
+  <!-- ====================================================================
+       ERROR HANDLING
+       ==================================================================== -->
+  <responseTransformer>
+    <steps>
+      <step index="0">
+        <name>Error Handler</name>
+        <script>
+          // If something goes wrong, still send back a response
+          // so Node.js service doesn't hang on timeout
+          
+          if (error) {
+            logger.error('Error processing file: ' + error);
+            responseStatus = 500;
+            return JSON.stringify({
+              status: 500,
+              error: error.toString()
+            });
+          }
+          
+          return response;
+        </script>
+      </step>
+    </steps>
+  </responseTransformer>
+  
+  <!-- ====================================================================
+       MESSAGE STORAGE & MONITORING
+       ==================================================================== -->
+  <storageSettings>
+    <messagesToKeep>1000</messagesToKeep>
+    <durableStatus>true</durableStatus>
+    <metaDataColumns>
+      <metaDataColumn>
+        <name>FILE_NAME</name>
+        <mappingName>fileName</mappingName>
+        <type>STRING</type>
+      </metaDataColumn>
+      <metaDataColumn>
+        <name>PATIENT_ID</name>
+        <mappingName>patientId</mappingName>
+        <type>STRING</type>
+      </metaDataColumn>
+      <metaDataColumn>
+        <name>MIME_TYPE</name>
+        <mappingName>mimeType</mappingName>
+        <type>STRING</type>
+      </metaDataColumn>
+    </metaDataColumns>
+  </storageSettings>
+  
+</channel>
