@@ -1,10 +1,11 @@
 const express = require('express');
-const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
-const sqlite3 = require('sqlite3').verbose(); // Optional: lightweight audit DB
+const sqlite3 = require('sqlite3').verbose();
 const { google } = require('googleapis');
 const dotenv = require('dotenv');
+const { createWorker } = require('tesseract.js');
+const Jimp = require('jimp');
 
 // Load environment variables
 dotenv.config();
@@ -17,19 +18,11 @@ const config = {
   // Google Drive
   googleDrive: {
     keyFile: process.env.GOOGLE_KEY_FILE || './credentials.json',
-    queueFolderId: process.env.QUEUE_FOLDER_ID, // Google Drive folder ID
-    processedFolderId: process.env.PROCESSED_FOLDER_ID, //move files after processing
-  },
-  // http://8.213.21.244:8070/api/channels/receive/
-  // Mirth Connect
-  mirth: {
-    baseUrl: process.env.MIRTH_BASE_URL || 'http://localhost:8088',
-    endpoint: process.env.MIRTH_ENDPOINT || '/api/channels/receive',
-    timeout: parseInt(process.env.MIRTH_TIMEOUT || '30000'), // 30 seconds
-    retries: parseInt(process.env.MIRTH_RETRIES || '3'),
+    queueFolderId: process.env.QUEUE_FOLDER_ID,
+    processedFolderId: process.env.PROCESSED_FOLDER_ID || "1MTj-jVoL6517HIjqt5cm_HefoxdXLISb",
   },
   
-  // Database (optional)
+  // Database
   database: {
     enabled: process.env.DB_ENABLED === 'true',
     file: process.env.DB_FILE || './file-queue.db',
@@ -38,9 +31,10 @@ const config = {
   // Service
   service: {
     port: parseInt(process.env.SERVICE_PORT || '3000'),
-    pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || '10000'), // 10 seconds
-    maxConcurrent: parseInt(process.env.MAX_CONCURRENT || '1'), // Process 1 file at a time
-    logLevel: process.env.LOG_LEVEL || 'info', // debug, info, warn, error
+    pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || '10000'),
+    maxConcurrent: parseInt(process.env.MAX_CONCURRENT || '1'),
+    logLevel: process.env.LOG_LEVEL || 'info',
+    outputDir: './payload_output', // Directory to write JSON payloads
   },
 };
 
@@ -298,21 +292,43 @@ class GoogleDriveClient {
     }
   }
 
-  async moveFileToFolder(fileId, targetFolderId) {
+  async moveFileToFolder(fileId, targetFolderId, removeFolderId = null) {
     try {
       const file = await this.drive.files.get({
         fileId,
         fields: 'parents',
       });
 
-      const previousParents = file.data.parents.join(',');
+      const currentParents = Array.isArray(file.data.parents) ? file.data.parents.filter(Boolean) : [];
+      logger.debug('Current file parents before move', { fileId, parents: currentParents });
 
-      await this.drive.files.update({
+      if (currentParents.includes(targetFolderId) && (!removeFolderId || !currentParents.includes(removeFolderId))) {
+        logger.info(`File ${fileId} is already in processed folder ${targetFolderId}`);
+        return;
+      }
+
+      const updateOptions = {
         fileId,
         addParents: targetFolderId,
-        removeParents: previousParents,
         fields: 'id, parents',
+      };
+
+      if (removeFolderId && currentParents.includes(removeFolderId)) {
+        updateOptions.removeParents = removeFolderId;
+      }
+
+      await this.drive.files.update(updateOptions);
+
+      const updatedFile = await this.drive.files.get({
+        fileId,
+        fields: 'parents',
       });
+      const updatedParents = Array.isArray(updatedFile.data.parents) ? updatedFile.data.parents.filter(Boolean) : [];
+      logger.debug('Current file parents after move', { fileId, parents: updatedParents });
+
+      if (removeFolderId && updatedParents.includes(removeFolderId)) {
+        throw new Error(`File ${fileId} still has queue folder parent ${removeFolderId} after move`);
+      }
 
       logger.info(`File ${fileId} moved to folder ${targetFolderId}`);
     } catch (error) {
@@ -323,9 +339,10 @@ class GoogleDriveClient {
 }
 
 // ============================================================================
-// MIRTH CONNECTOR
+// MIRTH CONNECTOR (COMMENTED OUT - Not used in current phase)
 // ============================================================================
 
+/*
 class MirthConnector {
   async sendFileWithRetry(payload, maxRetries = config.mirth.retries) {
     let lastError;
@@ -349,7 +366,6 @@ class MirthConnector {
           }
         );
 
-        // Check for ACK in response
         if (this.isValidAck(response)) {
           logger.info(`ACK received from Mirth for ${payload.fileName}`, {
             status: response.status,
@@ -367,7 +383,6 @@ class MirthConnector {
           waitingBeforeRetry: attempt < maxRetries ? `${attempt * 2}s` : null,
         });
 
-        // Exponential backoff: 2s, 4s, 8s, etc.
         if (attempt < maxRetries) {
           const delayMs = attempt * 2000;
           await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -380,22 +395,111 @@ class MirthConnector {
   }
 
   isValidAck(response) {
-    // Adjust based on your Mirth ACK format
-    // Common: 200/201 status or presence of specific headers/body fields
     return response.status >= 200 && response.status < 300;
   }
 }
+*/
 
 // ============================================================================
 // FILE PROCESSOR (Main Logic)
 // ============================================================================
 
 class FileProcessor {
-  constructor(googleDrive, mirth, fileQueue) {
+  constructor(googleDrive, fileQueue) {
     this.googleDrive = googleDrive;
-    this.mirth = mirth;
     this.fileQueue = fileQueue;
     this.processing = false;
+  }
+
+  /**
+   * Extract document type from image using OCR (Tesseract.js)
+   * Reads text from top section of image to find title/document type
+   */
+  async extractDocumentTypeFromImage(base64Data, fileName) {
+    try {
+      logger.info(`Extracting document type from image via OCR: ${fileName}`);
+      
+      const worker = await createWorker();
+      await worker.loadLanguage('eng');
+      await worker.initialize('eng');
+
+      const imageBuffer = Buffer.from(base64Data, 'base64');
+      const result = await worker.recognize(imageBuffer);
+      const extractedText = result.data.text || '';
+      await worker.terminate();
+      
+      logger.debug('OCR extracted text', { text: extractedText.substring(0, 500) });
+      
+      const candidateLines = extractedText
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0);
+
+      const headingKeywords = [
+        'lab', 'test', 'results', 'report', 'radiology', 'pathology',
+        'clinical', 'summary', 'discharge', 'consultation', 'medical',
+        'investigation', 'imaging', 'referral', 'certificate', 'record'
+      ];
+
+      const cleanLine = (line) => line.replace(/[^A-Za-z0-9 \-]/g, ' ').replace(/\s+/g, ' ').trim();
+      const isValidHeading = (line) => {
+        const normalized = cleanLine(line).toLowerCase();
+        return normalized.length >= 4 && /[a-zA-Z]{3,}\b/.test(normalized);
+      };
+
+      let docType = 'Unknown';
+
+      for (const line of candidateLines) {
+        const normalized = cleanLine(line).toLowerCase();
+        if (!isValidHeading(line)) continue;
+        if (headingKeywords.some(keyword => normalized.includes(keyword))) {
+          docType = line.substring(0, 120);
+          break;
+        }
+      }
+
+      if (docType === 'Unknown' && candidateLines.length > 0) {
+        const firstValid = candidateLines.find(line => isValidHeading(line));
+        if (firstValid) {
+          docType = firstValid.substring(0, 120);
+        }
+      }
+
+      if (docType === 'Unknown') {
+        docType = fileName.replace(/\.[^/.]+$/, '').replace(/^\d+_/, '');
+      }
+
+      logger.info(`Document type extracted: ${docType}`);
+      return docType;
+    } catch (error) {
+      logger.warn(`Failed to extract document type via OCR, using filename`, error);
+      return fileName.replace(/\.[^/.]+$/, '').replace(/^\d+_/, '');
+    }
+  }
+
+  /**
+   * Write payload to JSON file in output directory
+   */
+  async writePayloadToFile(payload, fileName) {
+    try {
+      // Ensure output directory exists
+      await fs.mkdir(config.service.outputDir, { recursive: true });
+      
+      // Create unique filename
+      const fileNameWithoutExt = fileName.replace(/\.[^/.]+$/, '');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const outputFileName = `${fileNameWithoutExt}_${timestamp}.json`;
+      const outputPath = path.join(config.service.outputDir, outputFileName);
+      
+      // Write payload to file
+      await fs.writeFile(outputPath, JSON.stringify(payload, null, 2), 'utf8');
+      
+      logger.info(`Payload written to file: ${outputPath}`);
+      return outputPath;
+    } catch (error) {
+      logger.error(`Failed to write payload to file`, error);
+      throw error;
+    }
   }
 
   async processNextFile() {
@@ -407,7 +511,7 @@ class FileProcessor {
     this.processing = true;
 
     try {
-      // Step 1: Get list of files from Google Drive
+      // Step 1: List files in queue
       const files = await this.googleDrive.listFilesInFolder(
         config.googleDrive.queueFolderId
       );
@@ -420,44 +524,57 @@ class FileProcessor {
       const file = files[0];
       logger.info(`Processing file from queue: ${file.name}`);
 
-      // Step 2: Record in database (audit trail)
+      // Step 2: Extract patient ID from filename
       const patientId = this.extractPatientIdFromFileName(file.name);
+
+      // Step 3: Record in database (optional audit trail)
       await this.fileQueue.recordFile(file.id, file.name, file.mimeType, patientId);
 
       try {
-        // Step 3: Download and convert to base64
+        // Step 4: Download file as base64
         const base64Data = await this.googleDrive.downloadFileAsBase64(file.id);
+        // logger.info(`File downloaded: ${file.name} (${base64Data.length} bytes)`);
 
-        // Step 4: Build Mirth payload
+        // Step 5: Extract document type using OCR (safe, with fallback)
+        const title = await extractTitleFromBase64(base64Data);
+        logger.info(`Document type extracted from image: ${title || 'N/A'}`);
+        const documentType = title || await this.extractDocumentTypeFromImage(base64Data, file.name);
+
+        // Step 6: Build simplified payload
         const payload = {
           fileName: file.name,
-          mimeType: file.mimeType,
           patientId: patientId,
-          docType:file.name.replace(/^\d+_/, '').replace(/\.[^/.]+$/, ''),
-          base64: base64Data,
+          documentType: documentType,
+          base64Image: base64Data,
           timestamp: new Date().toISOString(),
         };
 
-        logger.debug('Payload built', { fileName: file.name, size: base64Data.length });
-        logger.debug('Payload', payload);
-        // Step 6: Optional - Move file to processed folder
+        logger.debug('Payload built', {
+          fileName: file.name,
+          patientId: patientId,
+          documentType: documentType,
+        });
+
+        // Step 7: Write payload to JSON file
+        await this.writePayloadToFile(payload, file.name);
+
+        // Step 8: Move file to processed folder
         if (config.googleDrive.processedFolderId) {
+          logger.info(`Moving file to processed folder: ${file.name}`);
           await this.googleDrive.moveFileToFolder(
             file.id,
-            config.googleDrive.processedFolderId
+            config.googleDrive.processedFolderId,
+            config.googleDrive.queueFolderId
           );
+          logger.info(`File moved to processed folder: ${file.name}`);
         } else {
           logger.warn(
-            'Processed folder is not configured, file will remain in the queue folder',
+            'Processed folder is not configured, file will remain in queue',
             { fileName: file.name }
           );
         }
-        // Step 5: Send to Mirth with retry logic
-        await this.mirth.sendFileWithRetry(payload);
 
-        
-
-        // Step 7: Mark as processed in database
+        // Step 9: Mark as processed in database
         await this.fileQueue.updateFileStatus(
           file.id,
           'processed',
@@ -465,7 +582,7 @@ class FileProcessor {
           null
         );
 
-        logger.info(`Successfully processed and sent file: ${file.name}`);
+        logger.info(`Successfully processed file: ${file.name}`);
       } catch (error) {
         // Update database with error
         await this.fileQueue.updateFileStatus(
@@ -478,7 +595,6 @@ class FileProcessor {
         await this.fileQueue.incrementAttempts(file.id);
 
         logger.error(`Failed to process file ${file.name}`, error);
-        // Don't re-throw; continue processing other files
       }
     } catch (error) {
       logger.error('Unexpected error in processNextFile', error);
@@ -488,15 +604,31 @@ class FileProcessor {
   }
 
   extractPatientIdFromFileName(fileName) {
-    // Example: "19507-discharge.PNG" -> "19507"
-    // Adjust regex based on your naming convention
-    const match = fileName.match(/^(\d+)_/);
-    return match ? match[1] : 'UNKNOWN';
+    // Try several patterns to extract a patient ID (MRN):
+    // 1) Leading digits: "19507-discharge.PNG" -> "19507"
+    // 2) Digits before an underscore: "19507_anyname.png" -> "19507"
+    // 3) Any group of 4-15 digits in the filename
+    // Returns 'UNKNOWN' if none found
+    if (!fileName || typeof fileName !== 'string') return 'UNKNOWN';
+
+    // 1) Leading digits
+    let m = fileName.match(/^(\d{3,15})/);
+    if (m) return m[1];
+
+    // 2) digits after optional prefix and underscore
+    m = fileName.match(/(?:^|_)(\d{3,15})(?:_|\.|$)/);
+    if (m) return m[1];
+
+    // 3) any digits group
+    m = fileName.match(/(\d{4,15})/);
+    if (m) return m[1];
+
+    return 'UNKNOWN';
   }
 }
 
 // ============================================================================
-// EXPRESS SERVER (Health checks, metrics, manual triggers)
+// EXPRESS SERVER (Health checks, manual triggers)
 // ============================================================================
 
 const app = express();
@@ -510,7 +642,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    processing: fileProcessor.processing,
+    processing: fileProcessor ? fileProcessor.processing : false,
   });
 });
 
@@ -526,68 +658,22 @@ app.post('/api/process-next', async (req, res) => {
   }
 });
 
-// Get queue status (database optional)
-app.get('/api/queue-status', async (req, res) => {
-  if (!config.database.enabled) {
-    return res.json({ database: 'disabled' });
-  }
-
-  try {
-    const pending = await new Promise((resolve, reject) => {
-      fileProcessor.fileQueue.db.get(
-        'SELECT COUNT(*) as count FROM file_queue WHERE status = ?',
-        ['pending'],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row.count);
-        }
-      );
-    });
-
-    const processed = await new Promise((resolve, reject) => {
-      fileProcessor.fileQueue.db.get(
-        'SELECT COUNT(*) as count FROM file_queue WHERE status = ?',
-        ['processed'],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row.count);
-        }
-      );
-    });
-
-    const failed = await new Promise((resolve, reject) => {
-      fileProcessor.fileQueue.db.get(
-        'SELECT COUNT(*) as count FROM file_queue WHERE status = ?',
-        ['failed'],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row.count);
-        }
-      );
-    });
-
-    res.json({ pending, processed, failed });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // ============================================================================
 // STARTUP
 // ============================================================================
 
 async function start() {
   try {
-    logger.info('=== Google Drive → Mirth Service Starting ===');
+    logger.info('=== Google Drive → Payload Service Starting ===');
     logger.info('Configuration', {
-      googleDriveFolder: config.googleDrive.queueFolderId,
+      googleDriveQueueFolder: config.googleDrive.queueFolderId,
       processedFolder: config.googleDrive.processedFolderId || 'not configured',
-      mirthEndpoint: `${config.mirth.baseUrl}${config.mirth.endpoint}`,
+      outputDirectory: config.service.outputDir,
       pollInterval: `${config.service.pollIntervalMs}ms`,
       databaseEnabled: config.database.enabled,
     });
 
-    // Initialize database
+    // Initialize database (optional)
     const fileQueue = new FileQueue();
     await fileQueue.init();
     logger.info(`Database layer: ${config.database.enabled ? 'ENABLED' : 'DISABLED'}`);
@@ -596,11 +682,8 @@ async function start() {
     const googleDrive = new GoogleDriveClient();
     await googleDrive.init();
 
-    // Initialize Mirth connector
-    const mirth = new MirthConnector();
-
-    // Initialize file processor
-    fileProcessor = new FileProcessor(googleDrive, mirth, fileQueue);
+    // Initialize file processor (removed Mirth)
+    fileProcessor = new FileProcessor(googleDrive, fileQueue);
 
     // Start polling
     processingInterval = setInterval(async () => {
@@ -615,7 +698,6 @@ async function start() {
       logger.info('Endpoints:');
       logger.info(`  GET  /health           - Service health check`);
       logger.info(`  POST /api/process-next - Manually trigger file processing`);
-      logger.info(`  GET  /api/queue-status - Queue metrics (database only)`);
     });
   } catch (error) {
     logger.error('Failed to start service', error);
@@ -634,5 +716,73 @@ process.on('SIGINT', async () => {
 
   process.exit(0);
 });
+
+async function extractTitleFromBase64(base64String) {
+  const worker = await createWorker();
+  try {
+    await worker.loadLanguage('eng');
+    await worker.initialize('eng');
+
+    const imageBuffer = Buffer.from(base64String, 'base64');
+    const {
+      data: { text },
+    } = await worker.recognize(imageBuffer);
+
+    const rawLines = text
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    const cleanLine = (line) =>
+      line
+        .replace(/[^A-Za-z0-9 \-\/\(\)\[\]]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const isMeaningfulLine = (line) => {
+      const cleaned = cleanLine(line);
+      if (!cleaned) return false;
+      if (cleaned.length < 5) return false;
+      const words = cleaned.split(' ').filter(Boolean);
+      if (words.length < 2) return false;
+      const letterCount = (cleaned.match(/[A-Za-z]/g) || []).length;
+      const nonLetterCount = cleaned.length - letterCount;
+      return letterCount >= nonLetterCount && /[A-Za-z]{2,}\b/.test(cleaned);
+    };
+
+    logger.debug('OCR raw extracted text', { text: text.substring(0, 1000) });
+
+    const candidateLines = rawLines
+      .map((line, index) => {
+        const cleaned = cleanLine(line);
+        const letters = (cleaned.match(/[A-Za-z]/g) || []).length;
+        const digits = (cleaned.match(/[0-9]/g) || []).length;
+        const words = cleaned.split(' ').filter(Boolean).length;
+        const quality = letters * 3 + words * 5 - digits * 2;
+        return { index, original: line, cleaned, quality };
+      })
+      .filter((entry) => entry.cleaned.length > 0 && isMeaningfulLine(entry.original));
+
+    if (candidateLines.length === 0) {
+      logger.warn('No valid OCR heading found, returning null');
+      return null;
+    }
+
+    candidateLines.sort((a, b) => {
+      if (b.quality !== a.quality) return b.quality - a.quality;
+      if (b.cleaned.length !== a.cleaned.length) return b.cleaned.length - a.cleaned.length;
+      return a.index - b.index;
+    });
+
+    const topLine = candidateLines[0].cleaned;
+    logger.debug('OCR selected top heading', { text: topLine });
+    return topLine;
+  } catch (error) {
+    logger.error('Error extracting title from base64 image', error);
+    return null;
+  } finally {
+    await worker.terminate();
+  }
+}
 
 start();
