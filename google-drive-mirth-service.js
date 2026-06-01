@@ -418,59 +418,14 @@ class FileProcessor {
   async extractDocumentTypeFromImage(base64Data, fileName) {
     try {
       logger.info(`Extracting document type from image via OCR: ${fileName}`);
-      
-      const worker = await createWorker();
-      await worker.loadLanguage('eng');
-      await worker.initialize('eng');
-
-      const imageBuffer = Buffer.from(base64Data, 'base64');
-      const result = await worker.recognize(imageBuffer);
-      const extractedText = result.data.text || '';
-      await worker.terminate();
-      
-      logger.debug('OCR extracted text', { text: extractedText.substring(0, 500) });
-      
-      const candidateLines = extractedText
-        .split('\n')
-        .map(line => line.trim())
-        .filter(line => line.length > 0);
-
-      const headingKeywords = [
-        'lab', 'test', 'results', 'report', 'radiology', 'pathology',
-        'clinical', 'summary', 'discharge', 'consultation', 'medical',
-        'investigation', 'imaging', 'referral', 'certificate', 'record'
-      ];
-
-      const cleanLine = (line) => line.replace(/[^A-Za-z0-9 \-]/g, ' ').replace(/\s+/g, ' ').trim();
-      const isValidHeading = (line) => {
-        const normalized = cleanLine(line).toLowerCase();
-        return normalized.length >= 4 && /[a-zA-Z]{3,}\b/.test(normalized);
-      };
-
-      let docType = 'Unknown';
-
-      for (const line of candidateLines) {
-        const normalized = cleanLine(line).toLowerCase();
-        if (!isValidHeading(line)) continue;
-        if (headingKeywords.some(keyword => normalized.includes(keyword))) {
-          docType = line.substring(0, 120);
-          break;
-        }
+      const docType = await extractTitleFromBase64(base64Data);
+      if (docType) {
+        logger.info(`Document type extracted: ${docType}`);
+        return docType;
       }
 
-      if (docType === 'Unknown' && candidateLines.length > 0) {
-        const firstValid = candidateLines.find(line => isValidHeading(line));
-        if (firstValid) {
-          docType = firstValid.substring(0, 120);
-        }
-      }
-
-      if (docType === 'Unknown') {
-        docType = fileName.replace(/\.[^/.]+$/, '').replace(/^\d+_/, '');
-      }
-
-      logger.info(`Document type extracted: ${docType}`);
-      return docType;
+      logger.warn('OCR did not produce a valid document type, falling back to filename');
+      return fileName.replace(/\.[^/.]+$/, '').replace(/^\d+_/, '');
     } catch (error) {
       logger.warn(`Failed to extract document type via OCR, using filename`, error);
       return fileName.replace(/\.[^/.]+$/, '').replace(/^\d+_/, '');
@@ -722,11 +677,39 @@ async function extractTitleFromBase64(base64String) {
   try {
     await worker.loadLanguage('eng');
     await worker.initialize('eng');
+    await worker.setParameters({ tessedit_pageseg_mode: '6' });
 
     const imageBuffer = Buffer.from(base64String, 'base64');
-    const {
-      data: { text },
-    } = await worker.recognize(imageBuffer);
+    const image = await Jimp.read(imageBuffer);
+
+    const preprocessImage = async (img) => {
+      await img.grayscale().contrast(0.2).brightness(0.05).normalize();
+      return img.getBufferAsync(Jimp.MIME_PNG);
+    };
+
+    const topCropHeight = Math.min(Math.max(Math.floor(image.bitmap.height * 0.22), 120), 400);
+    const topCrop = image.clone().crop(0, 0, image.bitmap.width, topCropHeight);
+    const topBuffer = await preprocessImage(topCrop);
+
+    let text = '';
+    let ocrSource = 'topCrop';
+
+    try {
+      const topResult = await worker.recognize(topBuffer);
+      text = topResult?.data?.text || '';
+      logger.debug('OCR top crop text', { text: text.substring(0, 500) });
+    } catch (err) {
+      logger.warn('Top crop OCR failed, falling back to full image', err);
+    }
+
+    if (!text || !text.trim()) {
+      const fullImage = image.clone();
+      const fullBuffer = await preprocessImage(fullImage);
+      const fullResult = await worker.recognize(fullBuffer);
+      text = fullResult?.data?.text || '';
+      ocrSource = 'fullImage';
+      logger.debug('OCR full image text', { text: text.substring(0, 500) });
+    }
 
     const rawLines = text
       .split('\n')
@@ -735,7 +718,7 @@ async function extractTitleFromBase64(base64String) {
 
     const cleanLine = (line) =>
       line
-        .replace(/[^A-Za-z0-9 \-\/\(\)\[\]]+/g, ' ')
+        .replace(/[^A-Za-z0-9 \-\/\(\)\[\]\.\,]+/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
 
@@ -745,21 +728,33 @@ async function extractTitleFromBase64(base64String) {
       if (cleaned.length < 5) return false;
       const words = cleaned.split(' ').filter(Boolean);
       if (words.length < 2) return false;
-      const letterCount = (cleaned.match(/[A-Za-z]/g) || []).length;
-      const nonLetterCount = cleaned.length - letterCount;
-      return letterCount >= nonLetterCount && /[A-Za-z]{2,}\b/.test(cleaned);
+      const letters = (cleaned.match(/[A-Za-z]/g) || []).length;
+      const digits = (cleaned.match(/[0-9]/g) || []).length;
+      if (letters < digits) return false;
+      if (/^[^A-Za-z]*$/.test(cleaned)) return false;
+      return true;
     };
 
-    logger.debug('OCR raw extracted text', { text: text.substring(0, 1000) });
+    const scoreLine = (cleaned, index) => {
+      const letters = (cleaned.match(/[A-Za-z]/g) || []).length;
+      const digits = (cleaned.match(/[0-9]/g) || []).length;
+      const words = cleaned.split(' ').filter(Boolean).length;
+      const uppercaseWords = cleaned.split(' ').filter((w) => /^[A-Z][a-z]/.test(w)).length;
+      const punctuationBonus = /[\.\-\/\(\)\[\],]/.test(cleaned) ? 12 : 0;
+      const repeatedPatternPenalty = /([A-Z])\1{2,}/.test(cleaned) ? -40 : 0;
+      const digitPenalty = digits * 8;
+      const upperRatio = words > 0 ? (uppercaseWords / words) * 15 : 0;
+      const positionBonus = Math.max(0, 30 - index * 6);
+      return letters * 4 + words * 9 + upperRatio + punctuationBonus - digitPenalty + repeatedPatternPenalty + positionBonus;
+    };
+
+    logger.debug('OCR raw extracted text', { text: text.substring(0, 1000), source: ocrSource });
 
     const candidateLines = rawLines
       .map((line, index) => {
         const cleaned = cleanLine(line);
-        const letters = (cleaned.match(/[A-Za-z]/g) || []).length;
-        const digits = (cleaned.match(/[0-9]/g) || []).length;
-        const words = cleaned.split(' ').filter(Boolean).length;
-        const quality = letters * 3 + words * 5 - digits * 2;
-        return { index, original: line, cleaned, quality };
+        const score = scoreLine(cleaned, index);
+        return { index, original: line, cleaned, score };
       })
       .filter((entry) => entry.cleaned.length > 0 && isMeaningfulLine(entry.original));
 
@@ -769,13 +764,21 @@ async function extractTitleFromBase64(base64String) {
     }
 
     candidateLines.sort((a, b) => {
-      if (b.quality !== a.quality) return b.quality - a.quality;
+      if (b.score !== a.score) return b.score - a.score;
       if (b.cleaned.length !== a.cleaned.length) return b.cleaned.length - a.cleaned.length;
       return a.index - b.index;
     });
 
-    const topLine = candidateLines[0].cleaned;
-    logger.debug('OCR selected top heading', { text: topLine });
+    const topCandidates = candidateLines.slice(0, Math.min(3, candidateLines.length));
+    topCandidates.sort((a, b) => a.index - b.index);
+
+    const topLine = topCandidates[0].cleaned;
+    logger.debug('OCR selected top heading', {
+      text: topLine,
+      score: topCandidates[0].score,
+      index: topCandidates[0].index,
+      source: ocrSource,
+    });
     return topLine;
   } catch (error) {
     logger.error('Error extracting title from base64 image', error);
