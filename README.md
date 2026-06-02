@@ -1,6 +1,6 @@
-# Google Drive → Mirth File Processing Service
+# Google Drive → Constellation Document Processing Service
 
-**Production-grade Node.js service** that reads files from a Google Drive queue folder, encodes them to base64, and POSTs them to Mirth Connect with automatic retry logic, ACK handling, and optional SQLite audit database.
+**Production-grade Node.js service** that reads medical documents from a Google Drive queue folder, extracts document titles via OCR, maps them to document types, encodes to base64, and generates structured JSON payloads for the Constellation patient management system with MongoDB audit trail.
 
 ---
 
@@ -12,70 +12,79 @@
 |------|---------|
 | **`google-drive-mirth-service.js`** | Main service code (production-ready) |
 | **`package.json`** | NPM dependencies and scripts |
-| **`.env.example`** | Environment template (copy to `.env` and customize) |
+| **`.env`** | Environment configuration (MONGO_URI, Google Drive folders, etc.) |
 | **`credentials.json`** | Google Service Account JSON (you'll add this) |
+| **`mapping-documents-types.xlsx`** | Document type mapping reference (LOINC codes, categories) |
 
 ### Documentation
 
 | File | Contents |
 |------|----------|
 | **`QUICK_REFERENCE.md`** | 📍 **START HERE** - Commands, endpoints, quick fixes (5 min read) |
-| **`SETUP_AND_DEPLOYMENT.md`** | Complete setup guide: Google Drive → Mirth → Production (30 min read) |
+| **`SETUP_AND_DEPLOYMENT.md`** | Complete setup guide: Google Drive → MongoDB → Constellation (30 min read) |
 | **`OPERATIONAL_GUIDE.md`** | Monitoring, debugging, maintenance, common issues (reference) |
-| **`MIRTH_CHANNEL_EXAMPLE.xml`** | Example Mirth channel configuration (copy & customize) |
+| **`README.md`** | This file |
 
 ---
 
 ## 🚀 Quick Start (5 Minutes)
 
-### 1. Clone/Download This Project
+### 1. Prerequisites
+- Node.js 16+ (or higher)
+- npm or yarn
+- MongoDB 4.4+ (local or remote)
+- Google Service Account with Drive API enabled
+- Medical document files in a Google Drive folder
+
+### 2. Clone/Download This Project
 ```bash
 mkdir google-drive-mirth-service && cd google-drive-mirth-service
 # Copy all files into this directory
 ```
 
-### 2. Install Dependencies
+### 3. Install Dependencies
 ```bash
 npm install
 ```
 
-### 3. Get Google Credentials
+### 4. Get Google Credentials
 - Go to [Google Cloud Console](https://console.cloud.google.com/)
 - Create Service Account
-- Download JSON credentials
-- Save as `credentials.json` in project root
-- Share your Google Drive queue folder with the service account email
+- Download JSON credentials → save as `credentials.json` in project root
+- Enable Google Drive API
+- Share your Google Drive queue folder with the service account email (Editor access)
 
-### 4. Configure Service
+### 5. Configure Service
 ```bash
-cp .env.example .env
-nano .env
-# Fill in:
+# Edit .env with:
+# - MONGO_URI (e.g., mongodb://localhost:27017)
+# - MONGO_DB_NAME (e.g., google_drive_mirth)
 # - QUEUE_FOLDER_ID (from Google Drive URL)
-# - MIRTH_BASE_URL (e.g., http://localhost:8080)
+# - PROCESSED_FOLDER_ID (destination for processed files)
+# - GOOGLE_KEY_FILE (./credentials.json)
 ```
 
-### 5. Start Service
+### 6. Start Service
 ```bash
-npm run dev
+npm run start
 ```
 
 **Expected output:**
 ```
-[INFO] === Google Drive → Mirth Service Starting ===
-[INFO] Configuration { googleDriveFolder: '1A2B3C...', ... }
-[INFO] Service running on http://localhost:3000
-[INFO] Polling started (every 10000ms)
+[INFO] 2026-06-02T09:11:50.000Z - MongoDB connected
+[INFO] 2026-06-02T09:11:50.100Z - Loaded 45 document type mappings from spreadsheet
+[INFO] 2026-06-02T09:11:50.200Z - Service running on http://localhost:3000
+[INFO] 2026-06-02T09:11:50.300Z - Polling started (every 10000ms)
 ```
 
-### 6. Test
+### 7. Test
 ```bash
 # In another terminal:
 curl http://localhost:3000/health
-# Response: {"status":"ok",...}
+# Response: {"status":"ok", "timestamp":"...", "database":"connected"}
 ```
 
-**✓ You're ready!** Add a file to your Google Drive queue folder and watch the logs.
+**✓ You're ready!** Add a medical document file to your Google Drive queue folder and watch it process.
 
 ---
 
@@ -83,17 +92,16 @@ curl http://localhost:3000/health
 
 ```
 google-drive-mirth-service/
-├── google-drive-mirth-service.js    ← Main service
-├── package.json                      ← Dependencies
-├── .env                              ← Your configuration (created from .env.example)
-├── credentials.json                  ← Google Service Account (you add this)
-├── file-queue.db                     ← SQLite audit database (created on first run)
+├── google-drive-mirth-service.js      ← Main service
+├── package.json                        ← Dependencies
+├── .env                                ← Your configuration
+├── credentials.json                    ← Google Service Account (you add this)
+├── mapping-documents-types.xlsx        ← Document type reference
 │
-├── QUICK_REFERENCE.md               ← Quick commands & troubleshooting
-├── SETUP_AND_DEPLOYMENT.md          ← Full setup guide
-├── OPERATIONAL_GUIDE.md             ← Monitoring & maintenance
-├── MIRTH_CHANNEL_EXAMPLE.xml        ← Example Mirth config
-└── README.md                         ← This file
+├── QUICK_REFERENCE.md                 ← Quick commands & troubleshooting
+├── SETUP_AND_DEPLOYMENT.md            ← Full setup guide
+├── OPERATIONAL_GUIDE.md               ← Monitoring & maintenance
+└── README.md                           ← This file
 ```
 
 ---

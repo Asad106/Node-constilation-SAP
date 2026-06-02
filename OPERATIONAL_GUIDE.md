@@ -1,95 +1,130 @@
-# Operational Guide: Google Drive → Mirth Service
+# Operational Guide: Google Drive → Constellation Service
 
 ---
 
 ## Quick Start Checklist
 
 - [ ] Node.js 16+ installed
+- [ ] MongoDB 4.4+ running (local or remote)
 - [ ] `npm install` completed
 - [ ] `credentials.json` in project root (from Google Cloud)
 - [ ] `.env` configured with:
-  - [ ] `QUEUE_FOLDER_ID` (correct 25+ character string)
-  - [ ] `MIRTH_BASE_URL` (accessible URL)
-  - [ ] `MIRTH_ENDPOINT` (channel endpoint path)
+  - [ ] `MONGO_URI` (MongoDB connection string)
+  - [ ] `MONGO_DB_NAME` (database name)
+  - [ ] `QUEUE_FOLDER_ID` (Google Drive queue folder)
+  - [ ] `PROCESSED_FOLDER_ID` (Google Drive processed folder)
+- [ ] `mapping-documents-types.xlsx` in project root
 - [ ] Test file in Google Drive queue folder
-- [ ] Mirth channel running and returning HTTP 200
-- [ ] `npm run dev` starts without errors
-- [ ] `curl http://localhost:3000/health` returns OK
+- [ ] `npm run start` starts without errors
+- [ ] `curl http://localhost:3000/health` returns `{ "status": "ok" }`
 
 ---
 
 ## Common Issues & Solutions
 
-### Issue 1: "Cannot read property 'file' of undefined"
+### Issue 1: "MongoDB connection refused"
 
 **Error in logs:**
 ```
-[ERROR] Failed to initialize Google Drive client
-```
-
-**Cause**: `credentials.json` is missing or has wrong path.
-
-**Fix:**
-```bash
-# 1. Verify file exists
-ls -la credentials.json
-
-# 2. Verify it's valid JSON
-cat credentials.json | jq .
-
-# 3. Verify path in .env
-cat .env | grep GOOGLE_KEY_FILE
-# Should output: GOOGLE_KEY_FILE=./credentials.json
-
-# 4. If relative path doesn't work, use absolute:
-# .env:
-GOOGLE_KEY_FILE=/opt/mirth-file-processor/credentials.json
-```
-
----
-
-### Issue 2: "Error: Invalid Credentials"
-
-**Error in logs:**
-```
-[ERROR] Failed to initialize Google Drive client
-Error: Invalid value for: config.credentials
+[ERROR] Failed to connect to MongoDB
+Error: connect ECONNREFUSED 127.0.0.1:27017
 ```
 
 **Causes:**
-1. Service account doesn't have Drive API access
-2. Service account email not granted access to queue folder
-3. Credentials are invalid or corrupted
+1. MongoDB is not running
+2. Wrong `MONGO_URI` in `.env`
+3. MongoDB server is not accessible
 
 **Fix:**
 
 ```bash
-# Step 1: Verify credentials structure
-cat credentials.json | jq 'keys'
-# Should have: "type", "project_id", "private_key_id", "private_key", 
-# "client_email", "client_id", "auth_uri", "token_uri", etc.
+# Step 1: Verify MongoDB is running
+mongosh  # or: mongo (older versions)
+# Should show: test>
 
-# Step 2: Get service account email
-SERVICE_EMAIL=$(cat credentials.json | jq -r '.client_email')
-echo "Service account: $SERVICE_EMAIL"
+# Step 2: Check connection string
+cat .env | grep MONGO_URI
+# Example: MONGO_URI=mongodb://localhost:27017
 
-# Step 3: Manually verify API is enabled
-# Go to Google Cloud Console:
-# APIs & Services → Enabled APIs & Services → Search "Google Drive API"
-# Should see "Google Drive API" in the list with "Enable" button grayed out
+# Step 3: If using MongoDB Atlas (cloud):
+# Get connection string from: MongoDB Atlas → Cluster → Connect → Connection String
+# Format: mongodb+srv://username:password@cluster.mongodb.net/
 
-# Step 4: Share queue folder in Google Drive with service account
-# 1. Open Google Drive
-# 2. Right-click queue folder → Share
-# 3. Paste service account email
-# 4. Grant "Editor" access
-# 5. Uncheck "Notify people"
-# 6. Share
+# Step 4: Test connection manually
+mongosh "mongodb://localhost:27017"
 ```
 
 ---
 
-### Issue 3: "No Files Being Processed"
+### Issue 2: "Cannot read property of undefined - documentType"
+
+**Error in logs:**
+```
+[ERROR] Failed to process file - documentType is undefined
+```
+
+**Causes:**
+1. OCR failed to extract title from image
+2. Document type mapping file not found
+3. Mapping collection is empty in MongoDB
+
+**Fix:**
+
+```bash
+# Step 1: Verify mapping file exists
+ls -la mapping-documents-types.xlsx
+
+# Step 2: Check if mapping is loaded in MongoDB
+mongosh
+> use google_drive_mirth  # (or your MONGO_DB_NAME)
+> db.document_types.countDocuments()
+# Should return a number > 0
+
+# Step 3: Restart service to reload mapping
+npm run start
+
+# Step 4: Check if OCR is working
+curl http://localhost:3000/api/generate-sample/12345
+# Look for "documentType" field in response
+```
+
+---
+
+### Issue 3: "File not found in processed folder"
+
+**Error in logs:**
+```
+[ERROR] Failed to move file - File not found: 1X2Y3Z...
+```
+
+**Causes:**
+1. Service account doesn't have access to processed folder
+2. Processed folder ID is wrong
+3. Google Drive permission issue
+
+**Fix:**
+
+```bash
+# Step 1: Verify folder IDs are correct
+cat .env | grep FOLDER_ID
+
+# Step 2: Get service account email
+cat credentials.json | jq -r '.client_email'
+
+# Step 3: In Google Drive:
+# - Find PROCESSED_FOLDER_ID folder
+# - Right-click → Share
+# - Paste service account email
+# - Grant Editor access
+
+# Step 4: Test file move manually (optional)
+# Upload test file to QUEUE_FOLDER_ID
+# Watch logs for move operation
+```
+
+---
+
+### Issue 4: "No Files Being Processed"
 
 **Symptoms:**
 - Service is running
@@ -100,49 +135,95 @@ echo "Service account: $SERVICE_EMAIL"
 
 ```bash
 # Step 1: Check polling is active
-npm run dev 2>&1 | grep -i "polling started"
+npm run start 2>&1 | grep -i "polling started"
 
-# Step 2: Check queue folder ID is correct
-cat .env | grep QUEUE_FOLDER_ID
+# Step 2: Verify folder IDs are correct
+cat .env | grep FOLDER_ID
 
-# Step 3: Verify folder exists and has files
-# In Google Drive:
-# 1. Open the folder
-# 2. Copy folder ID from URL: https://drive.google.com/drive/folders/[ID]
-# 3. Compare with .env QUEUE_FOLDER_ID
+# Step 3: Confirm service account has access
+cat credentials.json | jq -r '.client_email'
+# Share this email with QUEUE_FOLDER_ID in Google Drive
 
 # Step 4: Add a test file and manually trigger
 curl -X POST http://localhost:3000/api/process-next
 
-# Step 5: Watch logs
-npm run dev
-# Should see: "[INFO] Processing file from queue: [filename]"
+# Step 5: Monitor logs for detailed activity
+npm run start
+# Should see: "[INFO] Found 1 files in queue"
 
-# Step 6: If still nothing, enable debug logging
-LOG_LEVEL=debug npm run dev
-# Should see detailed Google Drive API calls
+# Step 6: Enable debug logging for more detail
+LOG_LEVEL=debug npm run start
+# Shows detailed Google Drive and OCR operations
 ```
 
 ---
 
-### Issue 4: "Connection Refused" to Mirth
+### Issue 5: "OCR extraction failed - title is garbled"
 
 **Error in logs:**
 ```
-[WARN] Mirth send failed (attempt 1/3)
-Error: connect ECONNREFUSED 127.0.0.1:8080
+[WARN] OCR title extraction produced low-quality output: "HEHE HRERHERHBEE"
 ```
 
-**Cause**: Mirth is not running or endpoint is wrong.
+**Causes:**
+1. Image quality is poor/blurry
+2. Document title is not in the top portion of image
+3. OCR cannot recognize the language/font
 
 **Fix:**
 
 ```bash
-# Step 1: Test Mirth connectivity
-curl -v http://localhost:8080/api/status
+# Step 1: Check that Tesseract is working
+npm list tesseract.js
+# Should show: tesseract.js@latest
 
-# If that fails:
-# - Mirth is not running
+# Step 2: Test OCR with a known good image
+curl http://localhost:3000/api/generate-sample/test123
+# Check the "documentType" field in response
+
+# Step 3: If OCR is consistently bad:
+# - Improve image quality before uploading
+# - Ensure document title is in top 25% of image
+# - Use high-contrast, clear printing
+```
+
+---
+
+### Issue 6: "MongoDB document not inserting"
+
+**Error in logs:**
+```
+[ERROR] Failed to insert file record - validation failed
+```
+
+**Causes:**
+1. Required fields missing in payload
+2. Collection validation rules too strict
+3. MongoDB connection lost mid-operation
+
+**Fix:**
+
+```bash
+# Step 1: Check MongoDB connection
+mongosh "mongodb://localhost:27017"
+> use google_drive_mirth
+> db
+
+# Step 2: Inspect collection structure
+> db.file_queue.findOne()
+# Should show: { googleFileId, fileName, status, patientId, createdAt, ... }
+
+# Step 3: Check if collection exists
+> db.file_queue.stats()
+
+# Step 4: If collection is corrupted, drop and recreate
+> db.file_queue.drop()
+# Service will recreate on next restart
+> exit
+
+# Step 5: Restart service
+npm run start
+```
 # - URL in .env is wrong
 # - Firewall blocking port
 
@@ -196,94 +277,7 @@ MIRTH_TIMEOUT=60000    # 60 seconds instead of 30
 # In Mirth Admin:
 # 1. Channels → Select channel → Message Logger
 # 2. Look for errors in processing
-# 3. Check destination script for issues
 
-# Step 3: Add logging to Mirth destination
-// In Mirth destination Processor:
-logger.info('Received file: ' + msg['fileName']);
-logger.info('Payload size: ' + msg['base64'].length);
-var result = db.executeCachedQuery('SELECT 1');
-logger.info('Database check passed');
-// Process the file...
-
-# Step 4: Increase retry attempts
-# In .env:
-MIRTH_RETRIES=5        # 3 → 5 retries
-
-# Step 5: Check network latency
-# From service machine to Mirth server:
-ping mirth-server.company.com
-# Should be < 50ms
-```
-
----
-
-### Issue 6: "Database is locked" Error
-
-**Error in logs:**
-```
-[ERROR] Failed to update file status
-Error: database is locked
-```
-
-**Cause**: Multiple processes trying to write to SQLite simultaneously.
-
-**Fix:**
-
-```bash
-# Step 1: Ensure only 1 instance is running
-pm2 list
-# Should show 1 instance of mirth-filer
-
-# Step 2: Close any other SQLite connections
-# Check if you're running sqlite3 CLI on the DB:
-ps aux | grep sqlite3
-
-# Step 3: Increase SQLite timeout (in code)
-// In FileQueue.updateFileStatus():
-this.db.configure("busyTimeout", 5000); // 5 second timeout
-
-# Step 4: Use WAL mode for better concurrency
-// In FileQueue.init():
-this.db.run("PRAGMA journal_mode=WAL");
-
-# Step 5: If persistent, disable database
-# In .env:
-DB_ENABLED=false
-# Service will skip database operations entirely
-```
-
----
-
-### Issue 7: "File already processed" Error
-
-**Symptoms**: File is reprocessed multiple times (duplicates in Mirth).
-
-**Cause**: Service crashed before updating database status, or duplicate file in folder.
-
-**Fix:**
-
-```bash
-# Step 1: Check database status of problematic file
-sqlite3 file-queue.db
-sqlite> SELECT * FROM file_queue WHERE fileName = 'test.pdf';
-# Check the status column
-
-# Step 2: If status is 'pending', but file was processed:
-# Update manually:
-sqlite> UPDATE file_queue 
-        SET status = 'processed', mirthAckReceived = 1 
-        WHERE googleFileId = 'abc123';
-
-# Step 3: Prevent in future by moving processed files
-# In .env, set:
-PROCESSED_FOLDER_ID=your_processed_folder_id
-# Service will move files after successful processing
-
-# Step 4: If files keep coming back:
-# Check if someone is moving them back to queue folder
-# Or if there's a scheduled task that's duplicating them
-```
 
 ---
 
@@ -312,7 +306,145 @@ fi
 **Run every 30 seconds:**
 ```bash
 # In crontab:
-*/1 * * * * /opt/mirth-file-processor/healthcheck.sh >> /var/log/mirth-health.log
+*/1 * * * * /path/to/healthcheck.sh >> /var/log/constellation-service.log
+```
+
+---
+
+### MongoDB Health Check
+
+```bash
+#!/bin/bash
+# check if MongoDB is accessible
+
+MONGO_URI="${MONGO_URI:-mongodb://localhost:27017}"
+mongosh "$MONGO_URI" --eval "db.adminCommand('ping')" > /dev/null 2>&1
+
+if [ $? -eq 0 ]; then
+  echo "✓ MongoDB is reachable"
+  exit 0
+else
+  echo "✗ MongoDB is unreachable"
+  exit 1
+fi
+```
+
+---
+
+### Logging & Alerting
+
+```bash
+# View service logs
+npm run start 2>&1 | tee service.log
+
+# Monitor for errors
+npm run start 2>&1 | grep -i "error\|failed"
+
+# Save logs to file with timestamp
+npm run start > logs/service-$(date +%Y%m%d).log 2>&1 &
+
+# View MongoDB operations
+mongosh
+> use google_drive_mirth
+> db.currentOp()
+```
+
+---
+
+## Performance Tuning
+
+### MongoDB Indexes
+
+```javascript
+// Create indexes for better performance
+db.file_queue.createIndex({ status: 1 })
+db.file_queue.createIndex({ googleFileId: 1 }, { unique: true })
+db.file_queue.createIndex({ patientId: 1 })
+db.file_queue.createIndex({ createdAt: 1 })
+db.file_queue.createIndex({ status: 1, createdAt: 1 })
+
+// Check indexes
+db.file_queue.getIndexes()
+
+// Document types indexes
+db.document_types.createIndex({ documentType: 1 })
+db.document_types.createIndex({ loincCode: 1 })
+```
+
+### Connection Pooling
+
+```javascript
+// MongoDB automatically manages connection pooling
+// Default: 10 connections in pool
+// Max active connections: unlimited by default
+
+// To tune, modify in code:
+const client = new MongoClient(mongoUri, {
+  maxPoolSize: 50,        // Max 50 connections
+  minPoolSize: 10,        // Min 10 connections
+  maxIdleTimeMS: 45000,   // Close idle connections after 45s
+});
+```
+
+---
+
+## Backup & Recovery
+
+### MongoDB Backup
+
+```bash
+# Full database backup
+mongodump --uri "mongodb://localhost:27017" --out ./backup/$(date +%Y%m%d)
+
+# Restore from backup
+mongorestore --uri "mongodb://localhost:27017" --dir ./backup/20260602
+
+# Single collection export
+mongoexport --uri "mongodb://localhost:27017/google_drive_mirth" \
+  --collection file_queue \
+  --out file_queue_export.json
+
+# Single collection import
+mongoimport --uri "mongodb://localhost:27017/google_drive_mirth" \
+  --collection file_queue \
+  --file file_queue_export.json
+```
+
+---
+
+## Maintenance Tasks
+
+### Weekly Cleanup
+
+```bash
+# Remove failed records older than 30 days
+mongosh
+> use google_drive_mirth
+> db.file_queue.deleteMany({ 
+    status: "failed", 
+    createdAt: { $lt: new Date(Date.now() - 30*24*60*60*1000) }
+  })
+
+# Archive processed files older than 60 days
+> db.file_queue.find({ 
+    status: "processed", 
+    processedAt: { $lt: new Date(Date.now() - 60*24*60*60*1000) }
+  }).limit(100)
+```
+
+### Monthly Maintenance
+
+```bash
+# Rebuild indexes
+mongosh
+> use google_drive_mirth
+> db.file_queue.reIndex()
+
+# Check collection size
+> db.file_queue.stats()
+
+# Compact collection (if supported)
+> db.runCommand({ compact: "file_queue" })
 ```
 
 ---

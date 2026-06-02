@@ -6,33 +6,37 @@
 
 **What it does:**
 1. Polls Google Drive folder every 10 seconds
-2. Finds first file → downloads as base64
-3. Builds JSON: `{ fileName, mimeType, patientId, base64 }`
-4. POSTs to Mirth with retry logic (3 attempts, exponential backoff)
-5. Waits for HTTP 200 ACK
-6. Records in SQLite audit database
-7. Moves file to processed folder (optional)
-8. Repeats with next file
+2. Finds first file → extracts patient ID from filename
+3. Downloads file & converts to base64
+4. Applies OCR to extract document title
+5. Maps title to LOINC document types
+6. Builds JSON: `{ fileName, patientId, documentType, documentTypeDetails, base64Image, timestamp }`
+7. Saves payload to file
+8. Saves metadata to MongoDB audit trail
+9. Moves file to processed folder
+10. Repeats with next file
 
-**Time complexity:** ~2-5 seconds per file (depending on size and Mirth processing)
+**Time complexity:** ~3-8 seconds per file (including OCR)
 
 ---
 
-## Installation (3 Steps)
+## Installation (4 Steps)
 
 ```bash
-# 1. Download files and install
+# 1. Ensure MongoDB is running
+mongod  # or: net start MongoDB (Windows)
+
+# 2. Download files and install
 npm install
 
-# 2. Copy .env.example → .env and fill in values
-cp .env.example .env
-nano .env  # Add QUEUE_FOLDER_ID, MIRTH_BASE_URL, etc.
+# 3. Create .env and fill in values
+nano .env
+# Add: MONGO_URI, MONGO_DB_NAME, QUEUE_FOLDER_ID, PROCESSED_FOLDER_ID, etc.
 
-# 3. Add credentials.json from Google Cloud
-# (Download from Google Cloud Console)
+# 4. Add credentials.json from Google Cloud Console
 
-# 4. Start!
-npm run dev
+# 5. Start!
+npm run start
 ```
 
 ---
@@ -41,13 +45,13 @@ npm run dev
 
 | Variable | Required | Example | Purpose |
 |----------|----------|---------|---------|
+| `MONGO_URI` | Yes | `mongodb://localhost:27017` | MongoDB connection string |
+| `MONGO_DB_NAME` | Yes | `google_drive_mirth` | MongoDB database name |
 | `GOOGLE_KEY_FILE` | Yes | `./credentials.json` | Path to Google Service Account JSON |
-| `QUEUE_FOLDER_ID` | Yes | `1A2B3C...` | Google Drive folder containing files |
-| `MIRTH_BASE_URL` | Yes | `http://localhost:8080` | Mirth Connect host:port |
-| `MIRTH_ENDPOINT` | Yes | `/api/channels/receive` | Endpoint path on Mirth |
-| `DB_ENABLED` | No | `true` / `false` | Enable SQLite audit database |
-| `POLL_INTERVAL_MS` | No | `10000` | How often to check for files (ms) |
-| `LOG_LEVEL` | No | `debug` / `info` / `warn` | Verbosity of logs |
+| `QUEUE_FOLDER_ID` | Yes | `1A2B3C...` | Google Drive folder containing files to process |
+| `PROCESSED_FOLDER_ID` | Yes | `1X2Y3Z...` | Google Drive folder to move processed files to |
+| `POLL_INTERVAL_MS` | No | `10000` | How often to check for files (milliseconds) |
+| `NODE_ENV` | No | `production` / `development` | Runtime environment |
 
 ---
 
@@ -56,19 +60,25 @@ npm run dev
 ### Health Check
 ```bash
 GET /health
-# Response: { "status": "ok", "timestamp": "...", "processing": false }
+# Response: { "status": "ok", "timestamp": "...", "database": "connected" }
 ```
 
-### Queue Status
-```bash
-GET /api/queue-status
-# Response: { "pending": 5, "processed": 120, "failed": 2 }
-```
-
-### Manual Trigger
+### Process Next File
 ```bash
 POST /api/process-next
-# Response: { "status": "File processing initiated" }
+# Response: { "status": "success", "file": "12345_lab_result.PNG" }
+```
+
+### Generate Sample Payload
+```bash
+GET /api/generate-sample/12345
+# Response: { fileName, patientId, documentType, documentTypeDetails, base64Image, timestamp }
+```
+
+### Validate Sample Payload
+```bash
+GET /api/validate-sample/12345
+# Response: { payload: {...}, validation: { missingFields: [...] } }
 ```
 
 ---
@@ -76,63 +86,60 @@ POST /api/process-next
 ## File Flow Diagram
 
 ```
-Google Drive Folder
+Google Drive Queue Folder
     │
     ├─── test.pdf
-    ├─── 19507-discharge.PNG  ← Picked up
+    ├─── 12345_lab_result.PNG  ← Picked up
     └─── report.docx
          │
+         ↓ [Extract MRN: 12345]
          ↓ [Download + base64]
+         ↓ [OCR extract title]
+         ↓ [Match to document type mapping]
          │
     JSON Payload:
     {
-      "fileName": "19507-discharge.PNG",
-      "mimeType": "image/png",
-      "patientId": "19507",
-      "base64": "iVBORw0KGgo..."
+      "fileName": "12345_lab_result.PNG",
+      "patientId": "12345",
+      "documentType": "Lab. Test Results",
+      "documentTypeDetails": {
+        "category": "Laboratory",
+        "loincCode": "2345-7",
+        "loincDisplay": "Glucose in Serum"
+      },
+      "base64Image": "iVBORw0KGgo...",
+      "timestamp": "2026-06-02T09:11:50.000Z"
     }
          │
-         ↓ [POST to Mirth]
+         ↓ [Save to file]
+         ↓ [Save to MongoDB]
          │
-    Mirth Channel
+    MongoDB Collection (file_queue)
+    and Payload Output File
          │
-    Destination 1: Save to Database
-    Destination 2: Store to File System
+    Google Drive Processed Folder
+    (file moved here after success)
     Destination 3: Send to other systems
          │
-         ↓ [Return HTTP 200 ACK]
-         │
-    Node.js Service
-         │
-    ✓ Mark file as "processed"
-    ✓ Move to processed folder (optional)
-    ✓ Record in audit DB
-         │
-         ↓ [Pick up NEXT file in 10 seconds]
 ```
 
 ---
 
 ## Payload Format
 
-### Request (Node.js → Mirth)
+### Generated JSONPayload (Node.js → Output File + MongoDB)
 ```json
 {
-  "fileName": "19507-discharge.PNG",
-  "mimeType": "image/png",
-  "patientId": "19507",
-  "base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
-  "timestamp": "2024-01-15T10:30:50.123Z"
-}
-```
-
-### Response (Mirth → Node.js)
-```json
-{
-  "status": 200,
-  "message": "File processed successfully",
-  "fileName": "19507-discharge.PNG",
-  "patientId": "19507"
+  "fileName": "12345_lab_result.PNG",
+  "patientId": "12345",
+  "documentType": "Lab. Test Results",
+  "documentTypeDetails": {
+    "category": "Laboratory",
+    "loincCode": "2345-7",
+    "loincDisplay": "Glucose in Serum"
+  },
+  "base64Image": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ...",
+  "timestamp": "2026-06-02T09:11:50.000Z"
 }
 ```
 
@@ -143,54 +150,64 @@ Google Drive Folder
 ### Starting the Service
 ```bash
 npm start                    # Production mode
-npm run dev                  # Debug mode (LOG_LEVEL=debug)
-node google-drive-mirth-service.js  # Direct
-pm2 start google-drive-mirth-service.js  # With PM2
+npm run dev                  # Development mode with nodemon
+node google-drive-mirth-service.js  # Direct execution
 ```
 
 ### Monitoring
 ```bash
 curl http://localhost:3000/health           # Quick health check
-curl http://localhost:3000/api/queue-status  # Queue depth
-pm2 logs mirth-filer                        # Live logs
-tail -f /var/log/syslog | grep mirth        # System logs
+curl http://localhost:3000/api/process-next # Manual trigger
+curl http://localhost:3000/api/generate-sample/12345  # Test payload generation
 ```
 
 ### Testing
 ```bash
-# Manual process trigger
+# Manual file processing
 curl -X POST http://localhost:3000/api/process-next
 
-# Test Mirth connectivity
-curl http://localhost:8080/api/status
+# Test MongoDB connection
+mongosh "mongodb://localhost:27017"
 
-# Test direct Mirth POST
-curl -X POST http://localhost:8080/api/channels/receive \
-  -H "Content-Type: application/json" \
-  -d '{"test": "data"}'
+# Check generated payload
+curl http://localhost:3000/api/generate-sample/test123 | jq .
 ```
 
-### Database
+### MongoDB Queries
 ```bash
-sqlite3 file-queue.db                  # Open DB
-sqlite> SELECT * FROM file_queue;      # View all files
-sqlite> SELECT status, COUNT(*) FROM file_queue GROUP BY status;  # Summary
-sqlite> .quit                          # Exit
+# Connect to MongoDB
+mongosh
+
+# Switch to database
+> use google_drive_mirth
+
+# View all processed files
+> db.file_queue.find({ status: "processed" })
+
+# Count by status
+> db.file_queue.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }])
+
+# View document type mappings
+> db.document_types.find().limit(5)
+
+# Count document types loaded
+> db.document_types.countDocuments()
 ```
 
 ### Logs
 ```bash
-# View all logs
-pm2 logs mirth-filer
+# View live logs
+npm run start
 
 # View only errors
-pm2 logs mirth-filer | grep ERROR
+npm run start 2>&1 | grep ERROR
 
-# View from specific time
-journalctl -u mirth-file-processor --since "2 hours ago"
+# Enable debug logging
+LOG_LEVEL=debug npm run start
 
-# Count errors
-pm2 logs mirth-filer 2>&1 | grep -c ERROR
+# Save logs to file
+npm run start > service.log 2>&1 &
+tail -f service.log
 ```
 
 ---
@@ -199,12 +216,12 @@ pm2 logs mirth-filer 2>&1 | grep -c ERROR
 
 | Problem | Quick Fix |
 |---------|-----------|
-| No files being processed | 1. Add test file to Drive folder 2. Check `QUEUE_FOLDER_ID` in `.env` 3. Verify service account has access |
-| "Connection refused" to Mirth | 1. Start Mirth 2. Verify URL in `.env` 3. Check firewall: `telnet localhost 8080` |
-| "Invalid credentials" | 1. Check `credentials.json` exists 2. Verify Drive API enabled 3. Share queue folder with service account email |
-| ACK timeout | 1. Increase `MIRTH_TIMEOUT` in `.env` 2. Check Mirth channel is running 3. Look for errors in Mirth logs |
-| Database locked | 1. Ensure only 1 service instance running 2. Disable DB: `DB_ENABLED=false` |
-| Service won't start | 1. Check Node.js version: `node --version` 2. Reinstall deps: `npm install` 3. Check .env syntax |
+| No files being processed | 1. Add test file to Drive folder 2. Check `QUEUE_FOLDER_ID` in `.env` 3. Verify service account has been granted access |
+| "MongoDB connection refused" | 1. Start MongoDB: `mongod` 2. Verify `MONGO_URI` in `.env` 3. Check MongoDB is accessible |
+| "Google Drive permission denied" | 1. Share both queue & processed folders with service account 2. Grant Editor access 3. Check credentials.json is valid |
+| OCR title is garbled | 1. Check image quality (should be clear, high contrast) 2. Ensure title is in top portion of image 3. Try a different image |
+| Document type not matching | 1. Check mapping file: `mapping-documents-types.xlsx` exists 2. Verify MongoDB has document types loaded 3. Restart service: `npm run start` |
+| Service won't start | 1. Check Node.js version: `node --version` (should be 16+) 2. Reinstall deps: `npm install` 3. Check .env syntax with: `cat .env | jq -R .` |
 
 ---
 
@@ -212,100 +229,115 @@ pm2 logs mirth-filer 2>&1 | grep -c ERROR
 
 | Metric | Healthy | Warning | Critical |
 |--------|---------|---------|----------|
-| Files/hour | 60-100 | 10-60 | < 10 |
-| Processing time | 2-5s | 5-30s | > 30s |
-| ACK success rate | > 99% | 95-99% | < 95% |
-| Queue depth | 0-5 | 5-50 | > 50 |
-| Service uptime | 99.9% | 95-99.9% | < 95% |
+| Files/hour | 100+ | 50-100 | < 50 |
+| Processing time | 3-8s | 8-15s | > 15s |
+| MongoDB uptime | 99.9%+ | 95-99.9% | < 95% |
+| OCR success rate | > 95% | 85-95% | < 85% |
+| Queue depth | 0-10 | 10-50 | > 50 |
 
 **Check queue:**
 ```bash
-curl http://localhost:3000/api/queue-status | jq '.pending'
+curl http://localhost:3000/api/process-next
+mongosh -e "use google_drive_mirth; db.file_queue.countDocuments({ status: 'pending' })"
 ```
 
 ---
 
 ## File Naming Convention
 
-The service extracts **Patient ID** from file name using regex:
+The service extracts **Patient ID** (MRN) from filename:
 
 ```javascript
-// Pattern: ^(\d+)-
-// Examples:
-19507-discharge.PNG          → Patient ID: 19507
-19507_scan.pdf              → Patient ID: 19507
-PATIENT_19507_form.docx     → Patient ID: UNKNOWN (needs regex update)
-```
-
-**To customize**, edit this in `FileProcessor.extractPatientIdFromFileName()`:
-
-```javascript
-// Change from:
-const match = fileName.match(/^(\d+)-/);
-
-// To match your format:
-const match = fileName.match(/PATIENT_(\d+)_/);  // For "PATIENT_19507_file.pdf"
-const match = fileName.match(/\[(\d+)\]/);       // For "[19507]_file.pdf"
+// Supported patterns:
+12345.PNG                   → Patient ID: 12345
+12345_lab_result.PNG        → Patient ID: 12345
+12345_any_description.ext   → Patient ID: 12345
+MRN12345_file.PDF          → Patient ID: 12345 (first numeric sequence)
 ```
 
 ---
 
-## Database Schema
+## MongoDB Schema
 
-```sql
-CREATE TABLE file_queue (
-  id INTEGER PRIMARY KEY,
-  googleFileId TEXT UNIQUE,          -- Google Drive file ID
-  fileName TEXT,                     -- Original file name
-  mimeType TEXT,                     -- e.g., "image/png"
-  patientId TEXT,                    -- Extracted from file name
-  status TEXT,                       -- "pending", "processed", "failed"
-  createdAt DATETIME,                -- When added to queue
-  processedAt DATETIME,              -- When sent to Mirth
-  mirthAckReceived BOOLEAN,          -- Did Mirth return ACK?
-  errorMessage TEXT,                 -- Error message if failed
-  attempts INTEGER                   -- Number of retry attempts
-);
+```javascript
+// Collection: file_queue
+{
+  _id: ObjectId("..."),
+  googleFileId: "1fVqIcsMbjflawIG...",   // Google Drive file ID
+  fileName: "12345_lab_result.PNG",       // Original file name
+  mimeType: "image/png",                   // File MIME type
+  patientId: "12345",                      // Extracted from filename
+  status: "processed",                     // "pending", "processing", "processed", "failed"
+  createdAt: ISODate("2026-06-02T..."),   // When added to queue
+  processedAt: ISODate("2026-06-02T..."), // When successfully processed
+  errorMessage: null,                      // Error message if failed
+  attempts: 1                              // Retry attempt count
+}
+
+// Collection: document_types
+{
+  _id: ObjectId("..."),
+  documentType: "Lab. Test Results",       // Document type name
+  category: "Laboratory",                  // Category
+  loincCode: "2345-7",                     // LOINC code
+  loincDisplay: "Glucose in Serum"         // LOINC display name
+}
 ```
 
 **Useful queries:**
-```sql
--- Pending files
-SELECT * FROM file_queue WHERE status = 'pending';
+```javascript
+// Pending files (not yet processed)
+db.file_queue.find({ status: "pending" })
 
--- Files processed today
-SELECT COUNT(*) FROM file_queue WHERE DATE(processedAt) = DATE('now');
+// Files processed today
+db.file_queue.find({ 
+  processedAt: { $gte: new Date(new Date().setHours(0,0,0,0)) }
+})
 
--- Failed files
+// Failed files
 SELECT fileName, errorMessage, attempts FROM file_queue WHERE status = 'failed';
 
--- By patient
-SELECT patientId, COUNT(*) FROM file_queue WHERE status = 'processed' GROUP BY patientId;
+// Count by status
+db.file_queue.countDocuments({ status: "pending" })
+db.file_queue.countDocuments({ status: "processed" })
+db.file_queue.countDocuments({ status: "failed" })
+
+// By patient
+db.file_queue.aggregate([
+  { $match: { status: "processed" } },
+  { $group: { _id: "$patientId", count: { $sum: 1 } } }
+])
 ```
 
 ---
 
-## Retry Logic
+## Processing Flow
 
-**Attempt 1:** 0s (immediate)  
-**Attempt 2:** +2s (wait, retry)  
-**Attempt 3:** +4s (wait, retry)  
-**Attempt 4:** +8s (wait, retry)  
-**Max Retries:** 3 (configurable via `MIRTH_RETRIES`)
-
-If all fail → mark as "failed" in database, continue to next file.
+```
+1. Service polls QUEUE_FOLDER_ID every 10 seconds
+2. Finds first "pending" file
+3. Extracts Patient ID from filename (e.g., "12345_lab.PNG" → "12345")
+4. Downloads file and converts to base64
+5. Applies OCR to extract document title
+6. Matches title to document type mapping in MongoDB
+7. Builds JSON payload with all required fields
+8. Saves payload to file: sample_output/<fileId>_<name>.json
+9. Records metadata in MongoDB (file_queue collection)
+10. Moves file to PROCESSED_FOLDER_ID in Google Drive
+11. Marks status as "processed"
+12. Repeats with next file
+```
 
 ---
 
 ## Performance Tips
 
-**For high volume (1000+ files/day):**
+**For high volume (500+ files/day):**
 
 ```bash
 # .env tuning
 POLL_INTERVAL_MS=5000        # Check more frequently
-MIRTH_TIMEOUT=60000          # Give Mirth more time
-MIRTH_RETRIES=5              # More resilience
+NODE_ENV=production          # Disable debug logging
 LOG_LEVEL=warn               # Less logging overhead
 
 # System tuning
@@ -319,6 +351,14 @@ POLL_INTERVAL_MS=30000       # Check less frequently (save CPU)
 LOG_LEVEL=info               # Standard logging
 ```
 
+**MongoDB optimization:**
+```javascript
+// Ensure indexes exist
+db.file_queue.createIndex({ status: 1 })
+db.file_queue.createIndex({ googleFileId: 1 }, { unique: true })
+db.file_queue.createIndex({ createdAt: 1 })
+```
+
 ---
 
 ## Production Deployment Checklist
@@ -326,25 +366,27 @@ LOG_LEVEL=info               # Standard logging
 - [ ] Node.js 18+ installed on server
 - [ ] `npm install --production` completed
 - [ ] `.env` configured with production values
-- [ ] `credentials.json` in place with 600 permissions
-- [ ] Database backup strategy in place
+- [ ] `credentials.json` in place with proper permissions (600)
+- [ ] MongoDB backup strategy in place
 - [ ] Health check endpoint monitored
 - [ ] Error alerts configured
 - [ ] Service auto-restart on crash (systemd or PM2)
 - [ ] Log rotation configured
-- [ ] Firewall allows Mirth connectivity
+- [ ] Firewall allows Google Drive API connectivity
 - [ ] Test file processes end-to-end
-- [ ] Mirth channel returns HTTP 200 ACK
+- [ ] MongoDB connection is secure (if remote)
+- [ ] Processed folder verified in Google Drive
 
 ---
 
 ## Support Resources
 
-- **Logs:** `pm2 logs mirth-filer` or `journalctl -u mirth-file-processor`
-- **Health:** `curl http://localhost:3000/health`
-- **Queue Status:** `curl http://localhost:3000/api/queue-status`
-- **Database:** `sqlite3 file-queue.db`
-- **Mirth Status:** `curl http://localhost:8080/api/status`
+- **Live Logs:** `npm run start`
+- **Health Check:** `curl http://localhost:3000/health`
+- **Manual Trigger:** `curl -X POST http://localhost:3000/api/process-next`
+- **Generate Sample:** `curl http://localhost:3000/api/generate-sample/12345`
+- **MongoDB Admin:** `mongosh`
+- **Payload Output:** `./sample_output/` directory
 
 ---
 
@@ -352,11 +394,12 @@ LOG_LEVEL=info               # Standard logging
 
 | Component | Version |
 |-----------|---------|
-| Service | 1.0.0 |
+| Service | 2.0.0 |
 | Node.js | 16+ (18+ recommended) |
 | npm | 8+ |
-| Mirth | 4.1.0+ |
+| MongoDB | 4.4+ |
+| Tesseract.js | ^5.0.0 |
 
 ---
 
-**Last Updated:** 2024-01-15
+**Last Updated:** 2026-06-02

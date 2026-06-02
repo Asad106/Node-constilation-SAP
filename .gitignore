@@ -2,5 +2,4 @@
 .env
 .env.*
 credentials.json
-file-queue.db
 *.log

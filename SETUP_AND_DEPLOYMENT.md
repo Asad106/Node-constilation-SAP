@@ -1,6 +1,6 @@
-# Google Drive → Mirth File Processing Service
+# Google Drive → Constellation Document Processing Service
 
-**Production-grade Node.js service** that reads files from a Google Drive queue folder, extracts metadata, converts to base64, and POSTs to Mirth Connect with retry logic and optional database audit trail.
+**Production-grade Node.js service** that reads medical documents from a Google Drive queue folder, applies OCR for title extraction, maps to LOINC document types, converts to base64, and generates structured JSON payloads for Constellation patient creation with MongoDB persistence.
 
 ---
 
@@ -13,25 +13,35 @@ Google Drive Folder (Queue)
         ↓
    Read File (1st in folder)
         ↓
-   Record in DB (audit trail)
+   Extract Patient ID from filename (MRN)
         ↓
-   Download & Base64 encode
+   Download file & convert to Base64
+        ↓
+   Apply OCR to extract document title
+        ↓
+   Match title to Document Type mapping
+        ↓
+   Record in MongoDB (audit trail)
         ↓
    Build JSON payload:
    {
-     "fileName": "19507-discharge.PNG",
-     "mimeType": "image/png",
-     "patientId": "19507",
-     "base64": "iVBORw0KGgo..."
+     "fileName": "12345_lab_result.PNG",
+     "patientId": "12345",
+     "documentType": "Lab. Test Results",
+     "documentTypeDetails": {
+       "category": "Laboratory",
+       "loincCode": "83540.8",
+       "loincDisplay": "Glucose in Serum"
+     },
+     "base64Image": "iVBORw0KGgo...",
+     "timestamp": "2026-06-02T09:11:50.000Z"
    }
         ↓
-   POST to Mirth (with retry: 3 attempts, exp. backoff)
+   Save payload to file
         ↓
-   [Wait for ACK response]
+   Move file to "Processed" folder
         ↓
-   Mark as "processed" in DB (optional)
-        ↓
-   Move file to "Processed" folder (optional)
+   Mark as "processed" in MongoDB
         ↓
    Next file...
 ```
@@ -43,8 +53,9 @@ Google Drive Folder (Queue)
 - **Node.js** 16+ (we recommend LTS: 18 or 20)
 - **npm** or **yarn**
 - **Google Service Account** with Drive API enabled
-- **Mirth Connect** instance running and accessible
-- **SQLite3** (optional, for audit database)
+- **MongoDB** 4.4+ (local or remote instance)
+- **Tesseract OCR** (installed via Node package)
+- Medical document files (PNG, PDF, JPEG, etc.)
 
 ---
 
@@ -91,9 +102,40 @@ Google Drive Folder (Queue)
 
 ---
 
-## Step 2: Local Setup
+## Step 2: MongoDB Setup
 
-### 2a. Clone/Download Project
+### 2a. Install MongoDB (if not already installed)
+
+**Option A: Local MongoDB on Windows**
+```powershell
+# Download and install from https://www.mongodb.com/try/download/community
+
+# Or via Chocolatey
+choco install mongodb-community
+
+# Start MongoDB
+net start MongoDB
+```
+
+**Option B: MongoDB Atlas (Cloud)**
+1. Go to [MongoDB Atlas](https://www.mongodb.com/cloud/atlas)
+2. Create free account
+3. Create a cluster
+4. Get connection string: `mongodb+srv://username:password@cluster.mongodb.net/database`
+5. Add to `.env` as `MONGO_URI`
+
+**Verify MongoDB is running:**
+```bash
+mongo
+# Or with MongoDB 6.0+:
+mongosh
+```
+
+---
+
+## Step 3: Local Setup
+
+### 3a. Clone/Download Project
 
 ```bash
 # Create project directory
@@ -107,7 +149,7 @@ cd google-drive-mirth-service
 # - credentials.json (from Google Cloud Console)
 ```
 
-### 2b. Install Dependencies
+### 3b. Install Dependencies
 
 ```bash
 npm install
@@ -115,46 +157,82 @@ npm install
 
 Expected output:
 ```
-added 150 packages, and audited 152 packages in 12s
+added 150+ packages, and audited 152 packages
 ```
 
-### 2c. Configure Environment
+### 3c. Configure Environment
 
 ```bash
-# Copy the example and edit
-cp .env.example .env
+# Create and edit .env
+nano .env
 
-# Edit .env with your values:
-# - QUEUE_FOLDER_ID (from Step 1d)
-# - MIRTH_BASE_URL (e.g., http://localhost:8080 or http://mirth-server:8080)
-# - Optionally set PROCESSED_FOLDER_ID
+# Add the following values:
 ```
 
 **Example .env:**
 ```
+# MongoDB Configuration
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB_NAME=google_drive_mirth
+
+# Google Drive Configuration
 GOOGLE_KEY_FILE=./credentials.json
 QUEUE_FOLDER_ID=1A2B3C4D5E6F7G8H9I0J
-MIRTH_BASE_URL=http://localhost:8080
-MIRTH_ENDPOINT=/api/channels/receive
-MIRTH_RETRIES=3
-DB_ENABLED=true
-DB_FILE=./file-queue.db
+PROCESSED_FOLDER_ID=1X2Y3Z4D5E6F7G8H9ABC
+
+# Service Configuration
 SERVICE_PORT=3000
 POLL_INTERVAL_MS=10000
 LOG_LEVEL=info
+NODE_ENV=production
+
+# Document Type Mapping
+DOCUMENT_TYPES_FILE=./mapping-documents-types.xlsx
 ```
 
 ---
 
-## Step 3: Mirth Configuration
+## Step 4: Deployment
 
-### 3a. Mirth Channel Setup
+### 4a. Test the Service Locally
 
-Your Mirth channel must have:
+```bash
+# Start the service
+npm run start
 
-1. **Source Connector**: HTTP Listener (or leave receiver endpoint open)
-2. **Destination**: Whatever processes the received files (database, file system, etc.)
-3. **Response Format**: Return HTTP 200/201 with JSON ACK (e.g., `{"status": "OK", "id": "123"}`)
+# In another terminal, test health endpoint:
+curl http://localhost:3000/health
+
+# Expected response:
+# {"status":"ok","timestamp":"2026-06-02T...","database":"connected"}
+```
+
+### 4b. Manual File Processing
+
+```bash
+# Upload a test file to QUEUE_FOLDER_ID in Google Drive
+# File naming convention: <PATIENT_ID>_<description>.<ext>
+# Example: 12345_lab_result.PNG
+
+# Trigger manual processing:
+curl -X POST http://localhost:3000/api/process-next
+
+# Monitor logs:
+npm run start 2>&1 | tail -f
+```
+
+### 4c. Verify Processing
+
+Check after processing:
+
+1. **Google Drive**: File should move to PROCESSED_FOLDER_ID
+2. **MongoDB**: Run query:
+   ```bash
+   mongosh
+   > use google_drive_mirth
+   > db.file_queue.findOne({ status: "processed" })
+   ```
+3. **Payload Output**: Check `sample_output/` folder for generated JSON
 
 **Example Mirth destination script** (simple logging):
 ```javascript

@@ -6,6 +6,7 @@ const { google } = require('googleapis');
 const dotenv = require('dotenv');
 const { createWorker } = require('tesseract.js');
 const Jimp = require('jimp');
+const xlsx = require('xlsx');
 
 // Load environment variables
 dotenv.config();
@@ -28,6 +29,8 @@ const config = {
     mongoUri: process.env.MONGO_URI || 'mongodb://localhost:27017',
     dbName: process.env.MONGO_DB_NAME || 'google_drive_mirth',
     collectionName: 'file_queue',
+    documentTypesCollection: 'document_types',
+    documentTypesFile: process.env.MAPPING_DOCUMENT_TYPES_FILE || 'mapping-documents-types.xlsx',
   },
   
   // Service
@@ -194,6 +197,250 @@ class FileQueue {
       logger.info('MongoDB connection closed');
     } catch (error) {
       logger.error('Failed to close MongoDB connection', error);
+      throw error;
+    }
+  }
+}
+
+class DocumentTypeStore {
+  constructor() {
+    this.client = null;
+    this.db = null;
+    this.collection = null;
+    this.mappingsCache = null;
+    this.initialized = false;
+  }
+
+  async init() {
+    if (!config.database.enabled) {
+      this.initialized = true;
+      return;
+    }
+
+    try {
+      this.client = new MongoClient(config.database.mongoUri);
+      await this.client.connect();
+      this.db = this.client.db(config.database.dbName);
+      this.collection = this.db.collection(config.database.documentTypesCollection);
+
+      await this.collection.createIndex(
+        { documentType: 1 },
+        { unique: true, collation: { locale: 'en', strength: 2 } }
+      );
+
+      this.initialized = true;
+      logger.info('Document type store initialized');
+    } catch (error) {
+      logger.error('Failed to initialize document type store', error);
+      throw error;
+    }
+  }
+
+  async loadMappingsFromSpreadsheet() {
+    if (!config.database.enabled) {
+      logger.warn('Database disabled; skipping document type mapping import');
+      return;
+    }
+
+    try {
+      const mappingPath = path.resolve(config.database.documentTypesFile);
+      await fs.access(mappingPath);
+
+      const workbook = xlsx.readFile(mappingPath, { raw: false });
+      const sheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[sheetName];
+
+      // Read raw rows (arrays) so we can detect header row even when the sheet
+      // has empty leading rows or merged cells that confuse sheet_to_json.
+      const rawRows = xlsx.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+
+      // Find header row index by looking for expected column names
+      const headerCandidates = rawRows.map((r) => r.map((c) => (c || '').toString().toLowerCase()));
+      const expectedHeaders = ['document type', 'category', 'loinc code', 'loinc display'];
+      let headerIndex = -1;
+      for (let i = 0; i < headerCandidates.length; i++) {
+        const row = headerCandidates[i];
+        const matches = expectedHeaders.filter((h) => row.some((c) => c.includes(h)));
+        if (matches.length >= 2) { // require at least two header matches
+          headerIndex = i;
+          break;
+        }
+      }
+
+      if (headerIndex === -1) {
+        // Fall back to default sheet_to_json behavior and try to parse using keys
+        const fallbackRows = xlsx.utils.sheet_to_json(sheet, { defval: '' });
+        logger.info(`Loaded ${fallbackRows.length} rows from document type mapping spreadsheet (fallback)`);
+
+        const bulkOps = fallbackRows
+          .map((row) => {
+            const documentType = (row['Document Type'] || row['documentType'] || '').toString().trim();
+            if (!documentType) return null;
+
+            return {
+              updateOne: {
+                filter: { documentType },
+                update: {
+                  $set: {
+                    documentType,
+                    category: (row['Category'] || row['category'] || '').toString().trim(),
+                    loincCode: (row['LOINC Code'] || row['loincCode'] || '').toString().trim(),
+                    loincDisplay: (row['LOINC Display'] || row['loincDisplay'] || '').toString().trim(),
+                  },
+                },
+                upsert: true,
+              },
+            };
+          })
+          .filter(Boolean);
+
+        if (bulkOps.length > 0) {
+          await this.collection.bulkWrite(bulkOps, { ordered: false });
+        }
+
+        await this.refreshCache();
+        logger.info(`Loaded ${bulkOps.length} document type mappings from spreadsheet (fallback)`);
+        return;
+      }
+
+      const headers = rawRows[headerIndex].map((h) => (h || '').toString().trim());
+      const dataRows = rawRows.slice(headerIndex + 1).map((rowArr) => {
+        const obj = {};
+        for (let c = 0; c < headers.length; c++) {
+          const key = headers[c] || `col_${c}`;
+          obj[key] = rowArr[c] !== undefined && rowArr[c] !== null ? rowArr[c] : '';
+        }
+        return obj;
+      });
+
+      logger.info(`Detected header row at index ${headerIndex}, parsing ${dataRows.length} rows`);
+
+      const bulkOps = dataRows
+        .map((row) => {
+          // Try several header name variants
+          const documentType = (
+            row['Document Type'] || row['documentType'] || row['__EMPTY_1'] || row['__EMPTY_2'] || row['DocumentType'] || ''
+          ).toString().trim();
+          if (!documentType) return null;
+
+          const category = (
+            row['Category'] || row['category'] || row['__EMPTY_3'] || ''
+          ).toString().trim();
+          const loincCode = (
+            row['LOINC Code'] || row['loincCode'] || row['__EMPTY_4'] || ''
+          ).toString().trim();
+          const loincDisplay = (
+            row['LOINC Display'] || row['loincDisplay'] || row['__EMPTY_5'] || ''
+          ).toString().trim();
+
+          return {
+            updateOne: {
+              filter: { documentType },
+              update: {
+                $set: {
+                  documentType,
+                  category,
+                  loincCode,
+                  loincDisplay,
+                },
+              },
+              upsert: true,
+            },
+          };
+        })
+        .filter(Boolean);
+
+      if (bulkOps.length > 0) {
+        await this.collection.bulkWrite(bulkOps, { ordered: false });
+      }
+
+      await this.refreshCache();
+      logger.info(`Loaded ${bulkOps.length} document type mappings from spreadsheet`);
+    } catch (error) {
+      logger.error('Failed to load document type mappings from spreadsheet', error);
+      throw error;
+    }
+  }
+
+  async refreshCache() {
+    if (!config.database.enabled) {
+      this.mappingsCache = [];
+      return;
+    }
+
+    this.mappingsCache = await this.collection.find({}).toArray();
+  }
+
+  normalizeText(text) {
+    return text
+      ? text.toString().toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()
+      : '';
+  }
+
+  calculateMatchScore(normalizedTitle, mapping) {
+    const normalizedType = this.normalizeText(mapping.documentType);
+    const normalizedDisplay = this.normalizeText(mapping.loincDisplay);
+
+    let score = 0;
+
+    if (normalizedType && normalizedTitle === normalizedType) score += 1000;
+    if (normalizedDisplay && normalizedTitle === normalizedDisplay) score += 900;
+    if (normalizedType && normalizedType.includes(normalizedTitle)) score += 400;
+    if (normalizedDisplay && normalizedDisplay.includes(normalizedTitle)) score += 300;
+    if (normalizedTitle && normalizedTitle.includes(normalizedType)) score += 200;
+    if (normalizedTitle && normalizedTitle.includes(normalizedDisplay)) score += 180;
+
+    const titleWords = new Set(normalizedTitle.split(' ').filter(Boolean));
+    const typeWords = new Set(normalizedType.split(' ').filter(Boolean));
+    const displayWords = new Set(normalizedDisplay.split(' ').filter(Boolean));
+
+    const overlapType = [...titleWords].filter((word) => typeWords.has(word)).length;
+    const overlapDisplay = [...titleWords].filter((word) => displayWords.has(word)).length;
+
+    score += overlapType * 40;
+    score += overlapDisplay * 30;
+
+    if (titleWords.size > 0 && [...titleWords].every((word) => typeWords.has(word))) {
+      score += 200;
+    }
+
+    if (titleWords.size > 0 && [...titleWords].every((word) => displayWords.has(word))) {
+      score += 180;
+    }
+
+    return score;
+  }
+
+  async findBestMatch(title) {
+    if (!title) return null;
+    if (!this.mappingsCache) {
+      await this.refreshCache();
+    }
+
+    const normalizedTitle = this.normalizeText(title);
+    if (!normalizedTitle) return null;
+
+    let bestMatch = null;
+    let bestScore = 0;
+
+    for (const mapping of this.mappingsCache) {
+      const score = this.calculateMatchScore(normalizedTitle, mapping);
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = mapping;
+      }
+    }
+
+    return bestScore > 0 ? bestMatch : null;
+  }
+
+  async close() {
+    if (!this.client) return;
+    try {
+      await this.client.close();
+      logger.info('Document type store MongoDB connection closed');
+    } catch (error) {
+      logger.error('Failed to close document type store connection', error);
       throw error;
     }
   }
@@ -395,9 +642,10 @@ class MirthConnector {
 // ============================================================================
 
 class FileProcessor {
-  constructor(googleDrive, fileQueue) {
+  constructor(googleDrive, fileQueue, documentTypeStore) {
     this.googleDrive = googleDrive;
     this.fileQueue = fileQueue;
+    this.documentTypeStore = documentTypeStore;
     this.processing = false;
   }
 
@@ -485,11 +733,21 @@ class FileProcessor {
         logger.info(`Document type extracted from image: ${title || 'N/A'}`);
         const documentType = title || await this.extractDocumentTypeFromImage(base64Data, file.name);
 
-        // Step 6: Build simplified payload
+        // Step 6: Map the OCR document type to the configured document type store
+        const documentTypeMapping = await this.documentTypeStore.findBestMatch(documentType);
+
         const payload = {
           fileName: file.name,
           patientId: patientId,
           documentType: documentType,
+          documentTypeDetails: documentTypeMapping
+            ? {
+                documentType: documentTypeMapping.documentType,
+                category: documentTypeMapping.category,
+                loincCode: documentTypeMapping.loincCode,
+                loincDisplay: documentTypeMapping.loincDisplay,
+              }
+            : null,
           base64Image: base64Data,
           timestamp: new Date().toISOString(),
         };
@@ -616,6 +874,7 @@ async function start() {
       outputDirectory: config.service.outputDir,
       pollInterval: `${config.service.pollIntervalMs}ms`,
       databaseEnabled: config.database.enabled,
+      documentTypesFile: config.database.documentTypesFile,
     });
 
     // Initialize database (optional)
@@ -623,12 +882,17 @@ async function start() {
     await fileQueue.init();
     logger.info(`Database layer: ${config.database.enabled ? 'ENABLED' : 'DISABLED'}`);
 
+    const documentTypeStore = new DocumentTypeStore();
+    await documentTypeStore.init();
+    await documentTypeStore.loadMappingsFromSpreadsheet();
+    logger.info(`Document type store: ${config.database.enabled ? 'ENABLED' : 'DISABLED'}`);
+
     // Initialize Google Drive
     const googleDrive = new GoogleDriveClient();
     await googleDrive.init();
 
     // Initialize file processor (removed Mirth)
-    fileProcessor = new FileProcessor(googleDrive, fileQueue);
+    fileProcessor = new FileProcessor(googleDrive, fileQueue, documentTypeStore);
 
     // Start polling
     processingInterval = setInterval(async () => {
@@ -657,6 +921,10 @@ process.on('SIGINT', async () => {
 
   if (fileProcessor?.fileQueue?.db) {
     await fileProcessor.fileQueue.close();
+  }
+
+  if (fileProcessor?.documentTypeStore?.db) {
+    await fileProcessor.documentTypeStore.close();
   }
 
   process.exit(0);
