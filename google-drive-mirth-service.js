@@ -1,7 +1,7 @@
 const express = require('express');
 const fs = require('fs').promises;
 const path = require('path');
-const sqlite3 = require('sqlite3').verbose();
+const { MongoClient } = require('mongodb');
 const { google } = require('googleapis');
 const dotenv = require('dotenv');
 const { createWorker } = require('tesseract.js');
@@ -25,7 +25,9 @@ const config = {
   // Database
   database: {
     enabled: process.env.DB_ENABLED === 'true',
-    file: process.env.DB_FILE || './file-queue.db',
+    mongoUri: process.env.MONGO_URI || 'mongodb://localhost:27017',
+    dbName: process.env.MONGO_DB_NAME || 'google_drive_mirth',
+    collectionName: 'file_queue',
   },
   
   // Service
@@ -67,12 +69,14 @@ const logger = {
 };
 
 // ============================================================================
-// DATABASE LAYER (Optional - for audit trail)
+// DATABASE LAYER (MongoDB - for audit trail)
 // ============================================================================
 
 class FileQueue {
   constructor() {
+    this.client = null;
     this.db = null;
+    this.collection = null;
     this.initialized = false;
   }
 
@@ -82,130 +86,116 @@ class FileQueue {
       return;
     }
 
-    return new Promise((resolve, reject) => {
-      this.db = new sqlite3.Database(config.database.file, (err) => {
-        if (err) {
-          logger.error('Failed to open database', err);
-          reject(err);
-          return;
-        }
+    try {
+      this.client = new MongoClient(config.database.mongoUri);
+      await this.client.connect();
+      this.db = this.client.db(config.database.dbName);
+      this.collection = this.db.collection(config.database.collectionName);
 
-        this.db.serialize(() => {
-          // Create audit table
-          this.db.run(`
-            CREATE TABLE IF NOT EXISTS file_queue (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              googleFileId TEXT UNIQUE NOT NULL,
-              fileName TEXT NOT NULL,
-              mimeType TEXT NOT NULL,
-              patientId TEXT NOT NULL,
-              status TEXT NOT NULL DEFAULT 'pending',
-              createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-              processedAt DATETIME,
-              mirthAckReceived BOOLEAN DEFAULT 0,
-              errorMessage TEXT,
-              attempts INTEGER DEFAULT 0
-            );
-          `, (err) => {
-            if (err) logger.error('Failed to create table', err);
-          });
+      // Create unique index on googleFileId
+      await this.collection.createIndex({ googleFileId: 1 }, { unique: true });
+      // Create index on status for faster queries
+      await this.collection.createIndex({ status: 1 });
 
-          // Create index on status for faster queries
-          this.db.run(`
-            CREATE INDEX IF NOT EXISTS idx_status ON file_queue(status);
-          `, (err) => {
-            if (err) logger.error('Failed to create index', err);
-          });
-
-          this.initialized = true;
-          resolve();
-        });
-      });
-    });
+      this.initialized = true;
+      logger.info('MongoDB connection initialized');
+    } catch (error) {
+      logger.error('Failed to initialize MongoDB', error);
+      throw error;
+    }
   }
 
   async recordFile(googleFileId, fileName, mimeType, patientId) {
     if (!config.database.enabled) return;
 
-    return new Promise((resolve, reject) => {
-      this.db.run(
-        `INSERT OR IGNORE INTO file_queue (googleFileId, fileName, mimeType, patientId, status)
-         VALUES (?, ?, ?, ?, 'pending')`,
-        [googleFileId, fileName, mimeType, patientId],
-        function(err) {
-          if (err) {
-            logger.error('Failed to record file in queue', err);
-            reject(err);
-          } else {
-            resolve(this.lastID);
-          }
-        }
+    try {
+      const result = await this.collection.updateOne(
+        { googleFileId },
+        {
+          $setOnInsert: {
+            googleFileId,
+            fileName,
+            mimeType,
+            patientId,
+            status: 'pending',
+            createdAt: new Date(),
+            attempts: 0,
+            mirthAckReceived: false,
+          },
+        },
+        { upsert: true }
       );
-    });
+      logger.debug('File recorded in queue', { googleFileId, fileName });
+      return result;
+    } catch (error) {
+      logger.error('Failed to record file in queue', error);
+      throw error;
+    }
   }
 
   async getNextFile() {
     if (!config.database.enabled) return null;
 
-    return new Promise((resolve, reject) => {
-      this.db.get(
-        `SELECT * FROM file_queue WHERE status = 'pending' ORDER BY createdAt ASC LIMIT 1`,
-        (err, row) => {
-          if (err) {
-            logger.error('Failed to get next file from queue', err);
-            reject(err);
-          } else {
-            resolve(row);
-          }
-        }
-      );
-    });
+    try {
+      const file = await this.collection.findOne({ status: 'pending' });
+      return file;
+    } catch (error) {
+      logger.error('Failed to get next file from queue', error);
+      throw error;
+    }
   }
 
   async updateFileStatus(googleFileId, status, mirthAckReceived = false, errorMessage = null) {
     if (!config.database.enabled) return;
 
-    return new Promise((resolve, reject) => {
-      this.db.run(
-        `UPDATE file_queue 
-         SET status = ?, processedAt = CURRENT_TIMESTAMP, mirthAckReceived = ?, errorMessage = ?
-         WHERE googleFileId = ?`,
-        [status, mirthAckReceived ? 1 : 0, errorMessage, googleFileId],
-        function(err) {
-          if (err) {
-            logger.error('Failed to update file status', err);
-            reject(err);
-          } else {
-            resolve();
-          }
-        }
+    try {
+      const updateData = {
+        status,
+        processedAt: new Date(),
+      };
+
+      if (mirthAckReceived) {
+        updateData.mirthAckReceived = true;
+      }
+
+      if (errorMessage) {
+        updateData.errorMessage = errorMessage;
+      }
+
+      await this.collection.updateOne(
+        { googleFileId },
+        { $set: updateData }
       );
-    });
+      logger.debug('File status updated', { googleFileId, status });
+    } catch (error) {
+      logger.error('Failed to update file status', error);
+      throw error;
+    }
   }
 
   async incrementAttempts(googleFileId) {
     if (!config.database.enabled) return;
 
-    return new Promise((resolve, reject) => {
-      this.db.run(
-        `UPDATE file_queue SET attempts = attempts + 1 WHERE googleFileId = ?`,
-        [googleFileId],
-        function(err) {
-          if (err) reject(err);
-          else resolve();
-        }
+    try {
+      await this.collection.updateOne(
+        { googleFileId },
+        { $inc: { attempts: 1 } }
       );
-    });
+    } catch (error) {
+      logger.error('Failed to increment attempts', error);
+      throw error;
+    }
   }
 
   async close() {
-    if (!this.db) return;
-    return new Promise((resolve, reject) => {
-      this.db.close((err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
+    if (!this.client) return;
+    try {
+      await this.client.close();
+      logger.info('MongoDB connection closed');
+    } catch (error) {
+      logger.error('Failed to close MongoDB connection', error);
+      throw error;
+    }
   }
 }
 
